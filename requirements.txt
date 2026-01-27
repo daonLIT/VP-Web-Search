@@ -1,11 +1,12 @@
-langgraph
+langchain==1.2.7
 langchain-core
 langchain-community
+langchain-openai
 langchain-chroma
 chromadb
+langgraph==1.0.7
+langgraph-prebuilt
+langchain-tavily
 tavily-python
 python-dotenv
-
-# 선택: 요약/정리를 LLM으로 하려면
-langchain-openai
-openai
+langsmith
