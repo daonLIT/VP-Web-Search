@@ -1,0 +1,11 @@
+langgraph
+langchain-core
+langchain-community
+langchain-chroma
+chromadb
+tavily-python
+python-dotenv
+
+# 선택: 요약/정리를 LLM으로 하려면
+langchain-openai
+openai
