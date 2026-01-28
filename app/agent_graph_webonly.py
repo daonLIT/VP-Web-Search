@@ -25,16 +25,22 @@ SYSTEM_PROMPT_WEBONLY = """\
 3) 다음으로 web_fetch_and_store(...)를 호출해 원문 저장을 시도하라. (stored/skipped를 얻어라)
 4) 마지막으로 report_write_and_store(query_used, sources, snippets, stored, skipped)를 호출해
    리포트를 생성하고 DB에 저장하라.
-5) 최종 출력은 report_write_and_store의 결과 + sources를 포함한 JSON만 출력하라.
+5) tool 결과의 stored_report/report_id를 포함해 아래 스키마로만 출력해라.
    스키마:
    {
-     "query_used": "...",
-     "topic": "...",
-     "time_range": "...",
-     "stored": number,
-     "skipped": number,
-     "sources": [{"title":"...","url":"..."}]
-   }
+    "query_used": "...",
+    "topic": "...",
+    "time_range": "...",
+    "snippets_count": number,
+    "raw_stored_count": number,
+    "raw_skipped_count": number,
+    "stored_report": number,
+    "report_id": "...",
+    "sources": [{"title":"...","url":"..."}]
+    }
+6) 최종 출력은 report_write_and_store의 결과 + sources를 포함한 JSON만 출력하라.
+
+- news topic일 때 time_range를 지정하지 않았으면 반드시 "month"를 사용하라.
 """
 
 def build_webonly_agent_graph(vectordb, model_name: str) -> Any:
