@@ -21,10 +21,11 @@ SYSTEM_PROMPT_WEBONLY = """\
 
 규칙(강제):
 1) vector_search는 절대 호출하지 마라. (DB 조회 금지)
-2) 항상 먼저 web_search_snippets(query, topic, time_range, max_results)를 호출한다.
-   - 뉴스면 topic="news", time_range는 기본 "month"로.
-3) 그 다음 반드시 web_fetch_and_store(query, topic, time_range, max_results)를 호출해 저장한다.
-4) 최종 출력은 JSON만. (설명 텍스트 금지)
+2) 항상 먼저 web_search_snippets(...)를 호출해 snippets를 얻어라.
+3) 다음으로 web_fetch_and_store(...)를 호출해 원문 저장을 시도하라. (stored/skipped를 얻어라)
+4) 마지막으로 report_write_and_store(query_used, sources, snippets, stored, skipped)를 호출해
+   리포트를 생성하고 DB에 저장하라.
+5) 최종 출력은 report_write_and_store의 결과 + sources를 포함한 JSON만 출력하라.
    스키마:
    {
      "query_used": "...",
@@ -39,7 +40,7 @@ SYSTEM_PROMPT_WEBONLY = """\
 def build_webonly_agent_graph(vectordb, model_name: str) -> Any:
     # ✅ tools는 build_tools에서 가져오되, web-only로 제한한다.
     all_tools = build_tools(vectordb)
-    tools = [t for t in all_tools if t.name in ("web_search_snippets", "web_fetch_and_store")]
+    tools = [t for t in all_tools if t.name in ("web_search_snippets", "web_fetch_and_store", "report_write_and_store")]
 
     tool_node = ToolNode(tools)
 

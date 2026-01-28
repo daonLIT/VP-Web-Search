@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -7,6 +8,7 @@ from hashlib import sha256
 from langchain_core.tools import tool
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
+from langchain_openai import ChatOpenAI
 
 from langchain_tavily import TavilySearch, TavilyExtract
 
@@ -307,5 +309,92 @@ def build_tools(vectordb: Chroma) -> List[Any]:
             exclude_domains=exclude_domains,
             search_depth=search_depth,
         )
+    
+    @tool("report_write_and_store")
+    def report_write_and_store(
+        query_used: str,
+        sources: List[Dict[str, str]],
+        snippets: List[Dict[str, Any]],
+        stored: int = 0,
+        skipped: int = 0,
+        report_kind: str = "web_report",
+    ) -> Dict[str, Any]:
+        """
+        웹 검색 결과(스니펫/링크)를 LLM이 '리포트'로 요약/정리하고,
+        원본 링크 목록과 함께 ChromaDB에 1개 문서로 저장한다.
 
-    return [vector_search, web_search_snippets, web_fetch_and_store, web_search]
+        입력:
+        - query_used: 실제 사용한 검색 쿼리
+        - sources: [{title, url}]
+        - snippets: [{title,url,content,score}]
+        - stored/skipped: (선택) 원문 저장 도구 결과를 함께 기록
+        출력:
+        - stored_report: 1(성공) 또는 0
+        - report_id: content_hash
+        """
+
+        # LLM (짧게, 구조화)
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, timeout=30)
+
+        # 스니펫 텍스트를 너무 길게 보내지 않도록 컷
+        lines = []
+        for i, s in enumerate(snippets[:8], 1):
+            title = (s.get("title") or "").strip()
+            url = (s.get("url") or "").strip()
+            content = (s.get("content") or "").strip()
+            content = content[:800]  # 각 스니펫 길이 제한
+            lines.append(f"{i}. {title}\n- url: {url}\n- snippet: {content}")
+
+        prompt = f"""
+    너는 조사 리포트를 작성하는 분석가다.
+    주제: {query_used}
+
+    아래는 웹 검색 결과의 스니펫이다. 이것만을 근거로:
+    - 핵심 사실/이슈를 5~10개 불릿으로 요약
+    - 용어/배경이 필요하면 2~4줄 설명
+    - 앞으로 더 확인하면 좋을 질문 3개
+    - 마지막에 Sources 섹션에 원본 링크를 목록으로 포함
+
+    출력은 마크다운으로 작성.
+
+    [검색 스니펫]
+    {chr(10).join(lines)}
+    """.strip()
+
+        report_md = llm.invoke(prompt).content
+
+        sources_trim = sources[:10]
+        # Sources를 항상 붙여서 저장 (LLM이 빠뜨려도 보장)
+        if sources_trim:
+            src_lines = ["\n\n## Sources"]
+            for s in sources_trim:
+                title = (s.get("title") or "").strip()
+                url = (s.get("url") or "").strip()
+                if url:
+                    src_lines.append(f"- [{title or url}]({url})")
+            report_md = report_md.rstrip() + "\n" + "\n".join(src_lines) + "\n"
+
+        now = datetime.now(timezone.utc).isoformat()
+        report_hash = _hash_text(report_md)
+
+        
+        # Chroma에 "리포트 1개 문서" 저장
+        doc = Document(
+            page_content=report_md,
+            metadata={
+                "kind": report_kind,
+                "query": query_used,
+                "created_at": now,
+                "sources_json": json.dumps(sources_trim, ensure_ascii=False),  # ✅ 문자열
+                "sources_count": len(sources_trim),                            # ✅ int
+                "snippets_count": int(len(snippets)),                          # ✅ int
+                "raw_stored_count": int(stored),
+                "raw_skipped_count": int(skipped),
+                "content_hash": report_hash,
+            },
+        )
+        vectordb.add_documents([doc])
+
+        return {"stored_report": 1, "report_id": report_hash}
+
+    return [vector_search, web_search_snippets, web_fetch_and_store, web_search, report_write_and_store]
