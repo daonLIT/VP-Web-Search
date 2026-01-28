@@ -4,6 +4,8 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 from hashlib import sha256
+import random
+from pathlib import Path
 
 from langchain_core.tools import tool
 from langchain_core.documents import Document
@@ -67,7 +69,7 @@ def build_tools(vectordb: Chroma) -> List[Any]:
     # 2) Tavily search (SNIPPETS ONLY)
     # -----------------------------
     tavily_snippets = TavilySearch(
-        max_results=5,
+        max_results=15,
         topic="general",
         include_answer=True,
         include_raw_content=False,  # ✅ 모델로 원문 안 올림
@@ -104,33 +106,115 @@ def build_tools(vectordb: Chroma) -> List[Any]:
         - 각 항목: {title, url, content, score}
         - content는 요약/스니펫 수준의 짧은 텍스트만 포함
         """
-        args: Dict[str, Any] = {"query": query}
+        CACHE_PATH = Path(".cache") / "recent_search_urls.json"
+        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-        # invocation에서 바꿀 수 있는 파라미터만 세팅
-        if topic:
-            args["topic"] = topic
-        if time_range:
-            args["time_range"] = time_range
-        if include_domains:
-            args["include_domains"] = include_domains
-        if exclude_domains:
-            args["exclude_domains"] = exclude_domains
-        if search_depth:
-            args["search_depth"] = search_depth
+        def _load_recent_urls(limit: int = 200) -> list[str]:
+            if not CACHE_PATH.exists():
+                return []
+            try:
+                data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    return [str(x) for x in data][-limit:]
+            except Exception:
+                pass
+            return []
 
-        raw_out = tavily_snippets.invoke(args)
-        results = _normalize_tavily_search_output(raw_out)
+        def _save_recent_urls(urls: list[str], limit: int = 200) -> None:
+            try:
+                CACHE_PATH.write_text(
+                    json.dumps(urls[-limit:], ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+
+        def _is_hub_url(u: str) -> bool:
+            u = u.lower().rstrip("/")
+            bad_contains = ["/tag/", "/tags/", "/topic/", "/topics/"]
+            bad_exact_end = ["/news", "/crypto/bitcoin/news", "/symbols/btcusd/news"]
+            if any(x in u for x in bad_contains):
+                return True
+            if any(u.endswith(x) for x in bad_exact_end):
+                return True
+            # 도메인 단 메인
+            if u in {"https://coinness.com", "https://coinness.com/"}:
+                return True
+            return False
+        
+        queries = [
+            query,
+            f"{query} 기관 사칭",
+            f"{query} 가족 사칭",
+            f"{query} 스미싱 문자 링크",
+            f"{query} 앱 설치 유도",
+        ]
+
+        all_results = []
+        seen = set()
+
+        for q in queries:
+            args: Dict[str, Any] = {"query": q}
+
+            # invocation에서 바꿀 수 있는 파라미터만 세팅
+            if topic:
+                args["topic"] = topic
+            if time_range:
+                args["time_range"] = time_range
+            if include_domains:
+                args["include_domains"] = include_domains
+            if exclude_domains:
+                args["exclude_domains"] = exclude_domains
+            if search_depth:
+                args["search_depth"] = search_depth
+
+            raw_out = tavily_snippets.invoke(args)
+            results = _normalize_tavily_search_output(raw_out)
+
+            for r in results:
+                url = (r.get("url") or "").strip()
+                if not url or _is_hub_url(url):
+                    continue
+                if url in seen:
+                    continue
+                seen.add(url)
+                all_results.append(r)
+
+        recent_urls = _load_recent_urls()
+        recent_set = set(recent_urls)
+
+        # 1) 최근에 쓴 URL은 우선 제외
+        fresh_pool = []
+        for r in all_results:
+            u = (r.get("url") or "").strip()
+            if u and (u not in recent_set):
+                fresh_pool.append(r)
+
+        # 2) fresh_pool이 너무 적으면(새 결과가 부족하면) 전체 풀로 fallback
+        pool = fresh_pool if len(fresh_pool) >= int(max_results) else all_results
+
+        # 3) 실행마다 다른 결과가 나오도록 shuffle 후 max_results 만큼 선택
+        random.shuffle(pool)
+        picked = pool[: int(max_results)]
 
         cleaned: List[Dict[str, Any]] = []
-        for r in results[:5]:
+        picked_urls: list[str] = []
+        for r in picked:
+            url = (r.get("url") or "").strip()
             cleaned.append(
                 {
                     "title": (r.get("title") or "").strip(),
-                    "url": (r.get("url") or "").strip(),
-                    "content": (r.get("content") or "").strip(),
+                    "url": url,
+                    "content": (r.get("content") or "").strip()[:800],
                     "score": r.get("score"),
                 }
             )
+            if url:
+                picked_urls.append(url)
+
+        # 4) 이번에 뽑은 URL을 캐시에 누적 저장(최근 URL 회피용)
+        _save_recent_urls(recent_urls + picked_urls)
+
         return cleaned
 
     # -----------------------------
@@ -346,22 +430,42 @@ def build_tools(vectordb: Chroma) -> List[Any]:
             lines.append(f"{i}. {title}\n- url: {url}\n- snippet: {content}")
 
         prompt = f"""
-    너는 조사 리포트를 작성하는 분석가다.
-    주제: {query_used}
+        너는 보이스피싱 최신 수법을 '유형별 지식베이스'로 정리하는 분석가다.
+        주제는 반드시: 보이스피싱 최신 수법
 
-    아래는 웹 검색 결과의 스니펫이다. 이것만을 근거로:
-    - 핵심 사실/이슈를 5~10개 불릿으로 요약
-    - 용어/배경이 필요하면 2~4줄 설명
-    - 앞으로 더 확인하면 좋을 질문 3개
-    - 마지막에 Sources 섹션에 원본 링크를 목록으로 포함
+        아래 웹 검색 스니펫과 링크를 근거로, 최신 수법을 '유형(type)' 단위로 분류해서
+        반드시 아래 JSON 스키마로만 출력하라. (마크다운/설명 금지, JSON만)
 
-    출력은 마크다운으로 작성.
+        [JSON 스키마]
+        {{
+        "topic": "보이스피싱 최신 수법",
+        "as_of": "{datetime.now(timezone.utc).date().isoformat()}",
+        "types": [
+            {{
+            "type": "유형명(예: 기관 사칭, 가족/지인 사칭, 대출 사기, 택배/문자 링크, 몸캠/협박, 알바/구인, 중고거래, 투자/코인 등)",
+            "keywords": ["주요 키워드1","키워드2",],
+            "scenario": ["1) 단계별 시나리오", "2) ...", "3) ...", ...],
+            "red_flags": ["의심 신호 1", "의심 신호 2",],
+            "recommended_actions": ["대응 1", "대응 2",]
+            }}
+        ],
+        "sources": [
+            {{"title":"...","url":"..."}}
+        ]
+        }}
 
-    [검색 스니펫]
-    {chr(10).join(lines)}
-    """.strip()
+        규칙:
+        - types는 가능한 한 5~12개 사이로 뽑아라.
+        - scenario는 반드시 5~7 단계의 리스트로 써라.
+        - sources는 제공된 링크만 사용하라.
+        - 스니펫 근거가 약하면 type은 넣되 scenario/keywords를 보수적으로 작성하라.
+
+        [검색 스니펫]
+        {chr(10).join(lines)}
+        """.strip()
 
         report_md = llm.invoke(prompt).content
+        report_json_str = llm.invoke(prompt).content.strip()
 
         sources_trim = sources[:10]
         # Sources를 항상 붙여서 저장 (LLM이 빠뜨려도 보장)
@@ -375,26 +479,23 @@ def build_tools(vectordb: Chroma) -> List[Any]:
             report_md = report_md.rstrip() + "\n" + "\n".join(src_lines) + "\n"
 
         now = datetime.now(timezone.utc).isoformat()
-        report_hash = _hash_text(report_md)
+        report_hash = _hash_text(report_json_str)
 
         
         # Chroma에 "리포트 1개 문서" 저장
         doc = Document(
-            page_content=report_md,
+            page_content=report_json_str,   # ✅ JSON을 그대로 저장
             metadata={
-                "kind": report_kind,
-                "query": query_used,
+                "kind": "voicephishing_types_v1",
+                "query": "보이스피싱 최신 수법",
                 "created_at": now,
-                "sources_json": json.dumps(sources_trim, ensure_ascii=False),  # ✅ 문자열
-                "sources_count": len(sources_trim),                            # ✅ int
-                "snippets_count": int(len(snippets)),                          # ✅ int
-                "raw_stored_count": int(stored),
-                "raw_skipped_count": int(skipped),
+                "sources_count": int(len(sources_trim)),
+                "snippets_count": int(len(snippets or [])),
                 "content_hash": report_hash,
             },
         )
         vectordb.add_documents([doc])
 
-        return {"stored_report": 1, "report_id": report_hash}
+        return {"stored_report": 1, "report_id": report_hash, "kind": "voicephishing_types_v1"}
 
     return [vector_search, web_search_snippets, web_fetch_and_store, web_search, report_write_and_store]

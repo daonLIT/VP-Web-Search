@@ -18,6 +18,7 @@ SYSTEM_PROMPT_WEBONLY = """\
 - web_search_snippets로 짧은 결과를 확인한 뒤,
 - web_fetch_and_store로 원문(raw_content)을 DB에 저장한다.
 - 마지막에 저장 결과와 근거 URL 목록을 JSON으로 출력한다.
+- news topic이면 time_range는 반드시 "week"를 사용하라.
 
 규칙(강제):
 1) vector_search는 절대 호출하지 마라. (DB 조회 금지)
@@ -39,8 +40,6 @@ SYSTEM_PROMPT_WEBONLY = """\
     "sources": [{"title":"...","url":"..."}]
     }
 6) 최종 출력은 report_write_and_store의 결과 + sources를 포함한 JSON만 출력하라.
-
-- news topic일 때 time_range를 지정하지 않았으면 반드시 "month"를 사용하라.
 """
 
 def build_webonly_agent_graph(vectordb, model_name: str) -> Any:
