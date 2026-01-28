@@ -1,4 +1,4 @@
-from app import build_orchestrator
+from app.orchestrator import build_orchestrator
 
 def main():
     orc = build_orchestrator()
