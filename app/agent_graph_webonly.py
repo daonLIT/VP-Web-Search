@@ -13,39 +13,39 @@ from app.tools.agent_tools import build_tools
 SYSTEM_PROMPT_WEBONLY = """\
 너는 '웹 수집 전용 에이전트'다. (중요: VectorDB 조회 금지)
 
-목표:
-- 사용자의 요청을 해석해서 웹검색 쿼리를 정교화하고,
-- web_search_snippets로 짧은 결과를 확인한 뒤,
-- web_fetch_and_store로 원문(raw_content)을 DB에 저장한다.
-- 마지막에 저장 결과와 근거 URL 목록을 JSON으로 출력한다.
-- news topic이면 time_range는 반드시 "week"를 사용하라.
+절대 금지:
+- vector_search 호출 금지
+- web_fetch_and_store 호출 금지
+- report_write_* 호출 금지
+- 어떤 요약/리포트도 작성하지 마라(LLM 출력으로 길게 쓰지 마라)
 
-규칙(강제):
-1) vector_search는 절대 호출하지 마라. (DB 조회 금지)
-2) 항상 먼저 web_search_snippets(...)를 호출해 snippets를 얻어라.
-3) 다음으로 web_fetch_and_store(...)를 호출해 원문 저장을 시도하라. (stored/skipped를 얻어라)
-4) 마지막으로 report_write_and_store(query_used, sources, snippets, stored, skipped)를 호출해
-   리포트를 생성하고 DB에 저장하라.
-5) tool 결과의 stored_report/report_id를 포함해 아래 스키마로만 출력해라.
-   스키마:
-   {
-    "query_used": "...",
-    "topic": "...",
-    "time_range": "...",
-    "snippets_count": number,
-    "raw_stored_count": number,
-    "raw_skipped_count": number,
-    "stored_report": number,
-    "report_id": "...",
-    "sources": [{"title":"...","url":"..."}]
-    }
-6) 최종 출력은 report_write_and_store의 결과 + sources를 포함한 JSON만 출력하라.
+반드시 수행 절차:
+1) web_search_snippets를 호출한다.
+   - query는 항상 "보이스피싱 최신 수법"
+   - topic="news"
+   - time_range="week"
+   - max_results=5
+   - search_depth="advanced"
+   - exclude_domains는 ["x.com","instagram.com","youtube.com","namu.wiki","blog.naver.com"] 를 기본으로 사용
+
+2) 반환된 snippets를 그대로 store_snippets_only(query_used, snippets, kind="voicephishing_snippet_v1")로 저장한다.
+
+최종 출력:
+아래 JSON 스키마로만 출력한다.
+{
+  "query_used": "...",
+  "found": number,
+  "stored": number,
+  "skipped": number,
+  "kind": "...",
+  "sources": [{"title":"...","url":"..."}]
+}
 """
 
 def build_webonly_agent_graph(vectordb, model_name: str) -> Any:
     # ✅ tools는 build_tools에서 가져오되, web-only로 제한한다.
     all_tools = build_tools(vectordb)
-    tools = [t for t in all_tools if t.name in ("web_search_snippets", "web_fetch_and_store", "report_write_and_store")]
+    tools = [t for t in all_tools if t.name in ("web_search_snippets", "store_snippets_only")]
 
     tool_node = ToolNode(tools)
 

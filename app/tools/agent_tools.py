@@ -497,5 +497,273 @@ def build_tools(vectordb: Chroma) -> List[Any]:
         vectordb.add_documents([doc])
 
         return {"stored_report": 1, "report_id": report_hash, "kind": "voicephishing_types_v1"}
+    
+    @tool("store_snippets_only")
+    def store_snippets_only(
+        query_used: str,
+        snippets: List[Dict[str, Any]],
+        kind: str = "voicephishing_snippet_v1",
+    ) -> Dict[str, Any]:
+        """
+        LLM 없이 웹 검색 스니펫(title/url/content)만 ChromaDB에 저장한다.
+        - 기사 1개 = 문서 1개
+        - metadata는 Chroma 제약(원시타입)만 사용한다.
+        """
+        now = datetime.now(timezone.utc).isoformat()
 
-    return [vector_search, web_search_snippets, web_fetch_and_store, web_search, report_write_and_store]
+        stored = 0
+        skipped = 0
+        docs: List[Document] = []
+
+        for s in (snippets or []):
+            title = (s.get("title") or "").strip()
+            url = (s.get("url") or "").strip()
+            content = (s.get("content") or "").strip()
+            snippet_id = _hash_text(url)  # ✅ URL 기반 고유 ID
+
+            if not url:
+                skipped += 1
+                continue
+
+            # 너무 길면 자름 (저장용)
+            content = content[:600]
+
+            payload = {
+                "topic": "보이스피싱 최신 수법",
+                "query_used": query_used,
+                "article": {"title": title, "url": url},
+                "snippet": content,
+                "created_at": now,
+                "snippet_id": snippet_id,
+            }
+            page_content = json.dumps(payload, ensure_ascii=False)
+
+            content_hash = _hash_text(url + "|" + content)
+
+            docs.append(
+                Document(
+                    page_content=page_content,
+                    metadata={
+                        "kind": kind,
+                        "query": query_used,
+                        "title": title[:200],
+                        "url": url,
+                        "created_at": now,
+                        "content_hash": content_hash,
+                        # ✅ 추가
+                        "snippet_id": snippet_id,
+                        "processed": False,
+                        "used_in_report_id": "", 
+                    },
+                )
+            )
+            stored += 1
+
+        if docs:
+            vectordb.add_documents(docs)
+
+        return {"stored": stored, "skipped": skipped, "kind": kind}
+    
+
+    # =========================
+    # 1) LOAD: 수집된 스니펫 로드
+    # =========================
+    @tool("load_collected_snippets")
+    def load_collected_snippets(
+        limit: int = 5,
+        kind: str = "voicephishing_snippet_v1",
+        only_unprocessed: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        ChromaDB에 저장된 수집(snippet) 문서를 가져온다.
+        요약/리포트 단계에서 LLM 입력으로 사용한다.
+
+        반환:
+        {
+        "count": N,
+        "items": [
+            {
+            "doc_id": "...",        # Chroma 내부 문서 ID
+            "snippet_id": "...",    # URL 기반 고유 ID(없으면 None)
+            "title": "...",
+            "url": "...",
+            "created_at": "...",
+            "payload_json": "..."   # store_snippets_only가 저장한 page_content(JSON 문자열)
+            }, ...
+        ]
+        }
+        """
+        # langchain_chroma는 내부에 _collection(Chroma Collection)을 들고 있음
+        col = vectordb._collection  # private지만 실무에서 많이 씀
+
+        if only_unprocessed:
+            where = {
+                "$and": [
+                    {"kind": {"$eq": kind}},
+                    {"processed": {"$eq": False}},
+                ]
+            }
+        else:
+            where = {"kind": {"$eq": kind}}
+
+        data = col.get(where=where, limit=int(limit), include=["documents", "metadatas"])
+
+        items: List[Dict[str, Any]] = []
+        for doc_id, content, meta in zip(data.get("ids", []), data.get("documents", []), data.get("metadatas", [])):
+            items.append(
+                {
+                    "doc_id": doc_id,  # chroma 내부 id (있으면 유용)
+                    "snippet_id": meta.get("snippet_id"),
+                    "title": meta.get("title"),
+                    "url": meta.get("url"),
+                    "created_at": meta.get("created_at"),
+                    "payload_json": content,  # store_snippets_only가 넣은 JSON 문자열
+                }
+            )
+
+        return {"count": len(items), "items": items}
+    
+    # ==========================================
+    # 2) WRITE+STORE: 스니펫들 -> 리포트 저장
+    # ==========================================
+    @tool("write_report_from_snippets_and_store")
+    def write_report_from_snippets_and_store(
+        query_used: str,
+        snippet_items: List[Dict[str, Any]],
+        report_kind: str = "voicephishing_report_v1",
+    ) -> Dict[str, Any]:
+        """
+        수집된 snippet 여러 개를 기반으로 LLM이 요약 리포트를 작성하고 ChromaDB에 저장한다.
+        리포트는 수집 문서들과 연결될 수 있도록 source_snippet_ids_json을 metadata에 저장한다.
+
+        반환:
+        {"stored_report": 1, "report_id": "...", "source_count": N}
+        """
+        # LLM 1회만
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, timeout=20, max_retries=1)
+
+        # LLM 입력용 요약: payload_json에서 snippet만 뽑아 짧게 구성
+        normalized: List[Dict[str, Any]] = []
+        source_doc_ids: List[str] = []
+        source_snippet_ids: List[str] = []
+
+        for it in snippet_items:
+            doc_id = (it.get("doc_id") or "").strip()
+            source_doc_ids.append(doc_id)
+
+            sid = it.get("snippet_id") or ""
+            if not sid:
+                # snippet_id가 없던 구 데이터 대비: url로 만들어줌
+                # (가능하면 수집 단계에서 snippet_id를 항상 넣도록 권장)
+                try:
+                    payload_tmp = json.loads(it.get("payload_json") or "{}")
+                    url_tmp = ((payload_tmp.get("article") or {}).get("url") or it.get("url") or "").strip()
+                except Exception:
+                    url_tmp = (it.get("url") or "").strip()
+                sid = _hash_text(url_tmp) if url_tmp else _hash_text(doc_id or json.dumps(it, ensure_ascii=False))
+            source_snippet_ids.append(sid)
+
+            try:
+                payload = json.loads(it.get("payload_json") or "{}")
+            except Exception:
+                payload = {}
+
+            title = ((payload.get("article") or {}).get("title") or it.get("title") or "").strip()
+            url = ((payload.get("article") or {}).get("url") or it.get("url") or "").strip()
+            snippet = (payload.get("snippet") or "").strip()
+
+            normalized.append(
+                {
+                    "snippet_id": sid,
+                    "title": str(title)[:160],
+                    "url": str(url),
+                    "snippet": str(snippet)[:700],
+                }
+            )
+
+        if not normalized:
+            return {"stored_report": 0, "report_id": None, "source_count": 0, "reason": "no_snippets"}
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        prompt = f"""
+    너는 보이스피싱 최신 수법을 분석해 '리포트'로 정리하는 분석가다.
+    입력은 여러 개의 뉴스 스니펫이며, 각 스니펫에는 snippet_id가 있다.
+
+    출력 형식(반드시 지켜라):
+    - 유형 단위로 섹션을 나누어 작성:
+    유형: ...
+    주요 키워드: ... (여러 개)
+    시나리오:
+        1. ...
+        2. ...
+        3. ...
+    근거 snippet_id: ["...","..."]  (이 유형을 뒷받침하는 snippet_id들을 반드시 포함)
+
+    - 마지막에는 아래 예시처럼 "종합 분석 문단" 1개를 작성하라:
+    (예시 톤) "피해자는 권위와 전문성을 인지하여 ..."
+
+    규칙:
+    - 스니펫에서 확인 가능한 정보만 사용하고 과장/창작 금지
+    - "근거 snippet_id"는 반드시 JSON 배열 형태로 표기
+    - 전체 출력은 한국어 텍스트(마크다운 허용), 코드펜스 금지
+
+    [입력 스니펫들]
+    {json.dumps(normalized, ensure_ascii=False)}
+    """.strip()
+
+        report_text = llm.invoke(prompt).content.strip()
+
+        now = datetime.now(timezone.utc).isoformat()
+        report_id = _hash_text(report_text + "|" + now)
+
+        doc = Document(
+            page_content=report_text,
+            metadata={
+                "kind": report_kind,
+                "query": query_used,
+                "created_at": now,
+                "report_id": report_id,
+                # Chroma metadata 제약 때문에 JSON 문자열로 저장
+                "source_snippet_ids_json": json.dumps(source_snippet_ids, ensure_ascii=False),
+                "source_doc_ids_json": json.dumps(source_doc_ids, ensure_ascii=False),
+                "source_count": int(len(source_snippet_ids)),
+            },
+        )
+        vectordb.add_documents([doc])
+
+        return {"stored_report": 1, "report_id": report_id, "source_count": len(source_snippet_ids)}
+    
+    @tool("mark_snippets_processed")
+    def mark_snippets_processed(
+        doc_ids: List[str],
+        report_id: str,
+        kind: str = "voicephishing_snippet_v1",
+    ) -> Dict[str, Any]:
+        """
+        수집(snippet) 문서를 processed=True로 업데이트하고,
+        어떤 report_id에서 사용했는지 report_id도 기록한다.
+
+        doc_ids는 load_collected_snippets가 돌려준 items[*].doc_id 리스트를 넣는다.
+        """
+
+        col = vectordb._collection
+
+        # Chroma update는 ids 기준으로 가능
+        # metadata는 전체를 덮어쓸 수 있으니, 기존 metadata를 먼저 가져와 병합하는 방식이 안전
+        data = col.get(ids=doc_ids, include=["metadatas"])
+        old_metas = data.get("metadatas", []) or []
+
+        new_metas: List[Dict[str, Any]] = []
+        for meta in old_metas:
+            meta = dict(meta or {})
+            meta["kind"] = kind
+            meta["processed"] = True
+            meta["used_in_report_id"] = str(report_id or "")
+            meta["processed_at"] = datetime.now(timezone.utc).isoformat()
+            new_metas.append(meta)
+
+        col.update(ids=doc_ids, metadatas=new_metas)
+        return {"updated": len(doc_ids), "report_id": report_id}
+
+    return [vector_search, web_search_snippets, web_fetch_and_store, web_search, report_write_and_store, store_snippets_only, load_collected_snippets, write_report_from_snippets_and_store, mark_snippets_processed]
