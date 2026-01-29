@@ -10,3 +10,5 @@ langchain-tavily
 tavily-python
 python-dotenv
 langsmith
+fastapi
+uvicorn

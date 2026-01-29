@@ -7,6 +7,15 @@ from hashlib import sha256
 import random
 from pathlib import Path
 
+from bs4 import BeautifulSoup
+import requests
+from urllib.parse import urljoin, urlparse
+import re
+from typing import List, Dict, Any, Optional
+import time
+
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
 from langchain_core.tools import tool
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
@@ -38,6 +47,1124 @@ def _normalize_tavily_search_output(output: Any) -> List[Dict[str, Any]]:
 def build_tools(vectordb: Chroma) -> List[Any]:
     # -----------------------------
     # 1) Vector search (있지만 web-only 그래프에서는 안 씀)
+    # -----------------------------
+    @tool("search_existing_guidance")
+    def search_existing_guidance(
+        phishing_type: str,
+        scenario_hint: str = "",
+        top_k: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        DB에 저장된 보이스피싱 리포트/스니펫에서 특정 유형의 지침을 검색한다.
+        
+        입력:
+        - phishing_type: 보이스피싱 유형 (예: "검경 사칭", "기관 사칭", "가족 사칭")
+        - scenario_hint: 시나리오 힌트 (예: "검찰 사칭해서 현금 편취")
+        - top_k: 반환할 최대 결과 수
+        
+        출력:
+        {
+            "found": bool,
+            "count": int,
+            "guidances": [
+                {
+                    "type": str,
+                    "keywords": [str],
+                    "scenario": [str],
+                    "red_flags": [str],
+                    "recommended_actions": [str],
+                    "source_id": str,
+                    "relevance_score": float
+                }
+            ]
+        }
+        """
+        col = vectordb._collection
+        
+        # 검색 쿼리 구성
+        search_query = f"{phishing_type} {scenario_hint}".strip()
+        
+        # 1) 리포트 kind에서 검색
+        report_where = {"kind": {"$eq": "voicephishing_report_v1"}}
+        report_data = col.get(where=report_where, limit=50, include=["documents", "metadatas"])
+        
+        # 2) 유사도 검색 (벡터 검색)
+        vector_results = vectordb.similarity_search_with_relevance_scores(
+            search_query, 
+            k=top_k * 2,
+            filter={"kind": "voicephishing_report_v1"}
+        )
+        
+        guidances = []
+        seen_ids = set()
+        
+        # 벡터 검색 결과 우선 처리
+        for doc, score in vector_results:
+            content = doc.page_content
+            meta = doc.metadata
+            
+            # 리포트 텍스트 파싱 (유형별 섹션 추출)
+            try:
+                # 리포트가 구조화된 텍스트라고 가정
+                type_match = _extract_type_from_report(content, phishing_type)
+                if type_match and type_match["type"] not in seen_ids:
+                    seen_ids.add(type_match["type"])
+                    type_match["source_id"] = meta.get("report_id", "")
+                    type_match["relevance_score"] = float(score)
+                    guidances.append(type_match)
+                    
+                    if len(guidances) >= top_k:
+                        break
+            except Exception:
+                continue
+        
+        return {
+            "found": len(guidances) > 0,
+            "count": len(guidances),
+            "guidances": guidances
+        }
+
+
+    def _extract_type_from_report(report_text: str, target_type: str) -> Optional[Dict[str, Any]]:
+        """
+        리포트 텍스트에서 특정 유형의 정보를 추출한다.
+        """
+        import re
+        
+        # 유형 섹션 찾기 (예: "유형: 검경 사칭")
+        type_pattern = rf"유형:\s*([^\n]+)"
+        type_matches = list(re.finditer(type_pattern, report_text))
+        
+        for match in type_matches:
+            found_type = match.group(1).strip()
+            
+            # 유형이 일치하는지 확인 (부분 일치 허용)
+            if target_type.lower() in found_type.lower() or found_type.lower() in target_type.lower():
+                # 해당 유형 섹션 추출
+                section_start = match.start()
+                
+                # 다음 "유형:" 또는 문서 끝까지
+                next_match = None
+                for m in type_matches:
+                    if m.start() > section_start:
+                        next_match = m
+                        break
+                
+                section_end = next_match.start() if next_match else len(report_text)
+                section = report_text[section_start:section_end]
+                
+                # 섹션에서 정보 추출
+                keywords = _extract_field(section, r"주요 키워드:\s*([^\n]+)")
+                scenario = _extract_scenario(section)
+                red_flags = _extract_list_field(section, r"의심 신호|근거 snippet_id")
+                
+                return {
+                    "type": found_type,
+                    "keywords": keywords,
+                    "scenario": scenario,
+                    "red_flags": red_flags,
+                    "recommended_actions": []  # 리포트에 따라 추가
+                }
+        
+        return None
+
+
+    def _extract_field(text: str, pattern: str) -> List[str]:
+        """정규식으로 필드 추출 후 리스트로 변환"""
+        import re
+        match = re.search(pattern, text)
+        if match:
+            content = match.group(1).strip()
+            # 쉼표나 공백으로 구분
+            return [k.strip() for k in re.split(r'[,，、]', content) if k.strip()]
+        return []
+
+
+    def _extract_scenario(text: str) -> List[str]:
+        """시나리오 단계 추출"""
+        import re
+        scenario_pattern = r"시나리오:\s*((?:\d+[\.\)]\s*[^\n]+\n?)+)"
+        match = re.search(scenario_pattern, text)
+        if match:
+            steps = match.group(1).strip().split('\n')
+            return [re.sub(r'^\d+[\.\)]\s*', '', s).strip() for s in steps if s.strip()]
+        return []
+
+
+    def _extract_list_field(text: str, header_pattern: str) -> List[str]:
+        """리스트 형태 필드 추출"""
+        import re
+        pattern = rf"{header_pattern}:?\s*((?:[-\*•]\s*[^\n]+\n?)+)"
+        match = re.search(pattern, text)
+        if match:
+            items = match.group(1).strip().split('\n')
+            return [re.sub(r'^[-\*•]\s*', '', item).strip() for item in items if item.strip()]
+        return []
+
+
+    @tool("generate_targeted_guidance")
+    def generate_targeted_guidance(
+        phishing_type: str,
+        scenario: str,
+        victim_profile: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        특정 유형과 시나리오에 맞춘 웹 검색을 수행하고,
+        피해자 프로필을 고려한 맞춤형 지침을 생성한다.
+        
+        입력:
+        - phishing_type: 보이스피싱 유형
+        - scenario: 시나리오 설명
+        - victim_profile: 피해자 특성 (선택)
+        
+        출력:
+        {
+            "type": str,
+            "keywords": [str],
+            "scenario": [str],
+            "red_flags": [str],
+            "recommended_actions": [str],
+            "sources": [{title, url}]
+        }
+        """
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, timeout=30)
+        
+        # 검색 쿼리 구성
+        base_queries = [
+            f"보이스피싱 {phishing_type} 수법",
+            f"{phishing_type} {scenario}",
+            f"{phishing_type} 시나리오",
+        ]
+        
+        # 피해자 프로필 기반 추가 키워드
+        if victim_profile:
+            age = victim_profile.get("age")
+            occupation = victim_profile.get("occupation")
+            if age:
+                base_queries.append(f"{phishing_type} {age}대 피해")
+            if occupation:
+                base_queries.append(f"{phishing_type} {occupation} 대상")
+        
+        # 웹 검색 수행
+        all_snippets = []
+        all_sources = []
+        
+        for query in base_queries[:3]:  # 최대 3개 쿼리
+            args = {
+                "query": query,
+                "topic": "news",
+                "max_results": 3,
+                "time_range": "month",
+            }
+            
+            raw_out = tavily_snippets.invoke(args)
+            results = _normalize_tavily_search_output(raw_out)
+            
+            for r in results:
+                url = (r.get("url") or "").strip()
+                if url and not _is_hub_url(url):
+                    all_snippets.append({
+                        "title": r.get("title", ""),
+                        "url": url,
+                        "content": (r.get("content") or "")[:600],
+                    })
+                    all_sources.append({"title": r.get("title", ""), "url": url})
+        
+        # LLM으로 지침 생성
+        snippet_text = "\n\n".join([
+            f"출처: {s['title']}\nURL: {s['url']}\n내용: {s['content']}"
+            for s in all_snippets[:8]
+        ])
+        
+        victim_context = ""
+        if victim_profile:
+            victim_context = f"\n피해자 특성: {json.dumps(victim_profile, ensure_ascii=False)}"
+        
+        prompt = f"""
+    너는 보이스피싱 수법 분석 전문가다.
+    아래 웹 검색 결과를 기반으로 '{phishing_type}' 유형의 상세 지침을 생성하라.
+
+    시나리오 힌트: {scenario}{victim_context}
+
+    출력 형식 (반드시 JSON):
+    {{
+    "type": "{phishing_type}",
+    "keywords": ["키워드1", "키워드2", ...],
+    "scenario": [
+        "1단계: ...",
+        "2단계: ...",
+        "3단계: ...",
+        ...
+    ],
+    "red_flags": ["의심 신호1", "의심 신호2", ...],
+    "recommended_actions": ["대응법1", "대응법2", ...]
+    }}
+
+    규칙:
+    - scenario는 5~7단계로 구체적으로 작성
+    - 검색 결과에 근거한 내용만 포함
+    - 피해자 특성을 고려한 맞춤형 내용 작성
+
+    [검색 결과]
+    {snippet_text}
+    """.strip()
+        
+        response = llm.invoke(prompt).content.strip()
+        
+        # JSON 파싱
+        try:
+            # 코드 블록 제거
+            if response.startswith("```"):
+                response = response.split("```")[1]
+                if response.startswith("json"):
+                    response = response[4:]
+            
+            guidance = json.loads(response)
+            guidance["sources"] = all_sources[:5]
+            
+            return guidance
+        except Exception as e:
+            # 파싱 실패 시 기본 구조 반환
+            return {
+                "type": phishing_type,
+                "keywords": [phishing_type, scenario],
+                "scenario": [scenario],
+                "red_flags": [],
+                "recommended_actions": [],
+                "sources": all_sources[:5],
+                "error": str(e)
+            }
+
+
+    @tool("store_guidance_to_db")
+    def store_guidance_to_db(
+        guidance: Dict[str, Any],
+        source_system: str = "external_request",
+    ) -> Dict[str, Any]:
+        """
+        생성된 지침을 DB에 저장한다.
+        
+        입력:
+        - guidance: generate_targeted_guidance 출력
+        - source_system: 요청 출처
+        
+        출력:
+        {"stored": 1, "guidance_id": "..."}
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        
+        # JSON 문자열로 저장
+        content = json.dumps(guidance, ensure_ascii=False)
+        guidance_id = _hash_text(content)
+        
+        doc = Document(
+            page_content=content,
+            metadata={
+                "kind": "voicephishing_guidance_v1",
+                "phishing_type": guidance.get("type", ""),
+                "source_system": source_system,
+                "created_at": now,
+                "guidance_id": guidance_id,
+            }
+        )
+        
+        vectordb.add_documents([doc])
+        
+        return {"stored": 1, "guidance_id": guidance_id}
+    
+    @tool("crawl_site_for_phishing_cases")
+    def crawl_site_for_phishing_cases(
+        site_url: str,
+        keywords: List[str] = None,
+        max_articles: int = 10,
+        article_selector: Optional[str] = None,
+        title_selector: Optional[str] = None,
+        link_selector: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        특정 사이트의 목록 페이지에서 보이스피싱 관련 글을 필터링하고 링크를 수집한다.
+        
+        입력:
+        - site_url: 크롤링할 사이트 URL (예: 경찰청 공지사항 목록 페이지)
+        - keywords: 필터링 키워드 (기본: ["보이스피싱", "전화금융사기", "스미싱", "피싱"])
+        - max_articles: 최대 수집 글 수
+        - article_selector: 글 목록 CSS 셀렉터 (선택, 자동 감지 시도)
+        - title_selector: 제목 CSS 셀렉터 (선택)
+        - link_selector: 링크 CSS 셀렉터 (선택)
+        
+        출력:
+        {
+            "site_url": str,
+            "found_count": int,
+            "articles": [
+                {"title": str, "url": str, "matched_keywords": [str]},
+                ...
+            ]
+        }
+        """
+        if keywords is None:
+            keywords = [
+                "보이스피싱", "전화금융사기", "스미싱", "피싱", 
+                "메신저피싱", "사기", "금융사기", "텔레그램"
+            ]
+        
+        try:
+            # User-Agent 설정 (차단 방지)
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            response = requests.get(site_url, headers=headers, timeout=15)
+            response.raise_for_status()
+            response.encoding = response.apparent_encoding or 'utf-8'
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # 자동 셀렉터 감지 또는 지정된 셀렉터 사용
+            articles = []
+            
+            if article_selector:
+                # 사용자 지정 셀렉터
+                items = soup.select(article_selector)
+            else:
+                # 자동 감지: 일반적인 게시판 패턴들
+                items = (
+                    soup.select('tr') or  # 테이블 기반
+                    soup.select('li') or  # 리스트 기반
+                    soup.select('article') or
+                    soup.select('.board-list tr') or
+                    soup.select('.notice-list li')
+                )
+            
+            filtered_articles = []
+            
+            for item in items[:100]:  # 최대 100개까지만 탐색
+                # 제목 추출
+                if title_selector:
+                    title_elem = item.select_one(title_selector)
+                else:
+                    # 자동 감지
+                    title_elem = (
+                        item.select_one('td.title') or
+                        item.select_one('.title') or
+                        item.select_one('a') or
+                        item.select_one('h3') or
+                        item.select_one('h4')
+                    )
+                
+                if not title_elem:
+                    continue
+                
+                title = title_elem.get_text(strip=True)
+                
+                # 키워드 필터링
+                matched_keywords = [kw for kw in keywords if kw in title]
+                if not matched_keywords:
+                    continue
+                
+                # 링크 추출
+                if link_selector:
+                    link_elem = item.select_one(link_selector)
+                else:
+                    # 자동 감지
+                    link_elem = title_elem if title_elem.name == 'a' else item.select_one('a')
+                
+                if not link_elem:
+                    continue
+                
+                href = link_elem.get('href', '')
+                if not href:
+                    continue
+                
+                # 상대 URL → 절대 URL 변환
+                full_url = urljoin(site_url, href)
+                
+                filtered_articles.append({
+                    "title": title,
+                    "url": full_url,
+                    "matched_keywords": matched_keywords
+                })
+                
+                if len(filtered_articles) >= max_articles:
+                    break
+            
+            return {
+                "site_url": site_url,
+                "found_count": len(filtered_articles),
+                "articles": filtered_articles
+            }
+        
+        except Exception as e:
+            return {
+                "site_url": site_url,
+                "found_count": 0,
+                "articles": [],
+                "error": str(e)
+            }
+
+
+    @tool("extract_article_content")
+    def extract_article_content(
+        article_url: str,
+        content_selector: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        개별 글의 본문 내용을 추출한다.
+        
+        입력:
+        - article_url: 글 상세 페이지 URL
+        - content_selector: 본문 CSS 셀렉터 (선택, 자동 감지 시도)
+        
+        출력:
+        {
+            "url": str,
+            "title": str,
+            "content": str,
+            "extracted": bool
+        }
+        """
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            response = requests.get(article_url, headers=headers, timeout=15)
+            response.raise_for_status()
+            response.encoding = response.apparent_encoding or 'utf-8'
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # 제목 추출
+            title_elem = (
+                soup.select_one('h1') or
+                soup.select_one('h2.title') or
+                soup.select_one('.subject') or
+                soup.select_one('.post-title')
+            )
+            title = title_elem.get_text(strip=True) if title_elem else ""
+            
+            # 본문 추출
+            if content_selector:
+                content_elem = soup.select_one(content_selector)
+            else:
+                # 자동 감지: 일반적인 본문 패턴들
+                content_elem = (
+                    soup.select_one('div.content') or
+                    soup.select_one('div.post-content') or
+                    soup.select_one('div.article-body') or
+                    soup.select_one('div#content') or
+                    soup.select_one('article') or
+                    soup.select_one('.view-content') or
+                    soup.select_one('.board-view')
+                )
+            
+            if not content_elem:
+                # fallback: body에서 script/style 제거 후 추출
+                for tag in soup(['script', 'style', 'nav', 'header', 'footer']):
+                    tag.decompose()
+                content_elem = soup.select_one('body')
+            
+            # 텍스트 추출 및 정제
+            content = content_elem.get_text(separator='\n', strip=True) if content_elem else ""
+            
+            # 과도한 공백 제거
+            content = re.sub(r'\n\s*\n', '\n\n', content)
+            content = re.sub(r' +', ' ', content)
+            
+            return {
+                "url": article_url,
+                "title": title,
+                "content": content[:5000],  # 최대 5000자
+                "extracted": bool(content)
+            }
+        
+        except Exception as e:
+            return {
+                "url": article_url,
+                "title": "",
+                "content": "",
+                "extracted": False,
+                "error": str(e)
+            }
+
+
+    @tool("crawl_and_extract_batch")
+    def crawl_and_extract_batch(
+        site_url: str,
+        keywords: List[str] = None,
+        max_articles: int = 10,
+        delay_seconds: float = 1.0,
+    ) -> Dict[str, Any]:
+        """
+        사이트 크롤링 + 본문 추출을 한번에 처리한다.
+        
+        입력:
+        - site_url: 목록 페이지 URL
+        - keywords: 필터링 키워드
+        - max_articles: 최대 수집 글 수
+        - delay_seconds: 요청 간 지연 시간 (서버 부하 방지)
+        
+        출력:
+        {
+            "site_url": str,
+            "crawled_count": int,
+            "extracted_count": int,
+            "articles": [
+                {
+                    "title": str,
+                    "url": str,
+                    "content": str,
+                    "matched_keywords": [str]
+                },
+                ...
+            ]
+        }
+        """
+        # 1단계: 목록에서 관련 글 수집
+        crawl_result = crawl_site_for_phishing_cases.invoke({
+            "site_url": site_url,
+            "keywords": keywords,
+            "max_articles": max_articles
+        })
+        
+        if crawl_result.get("found_count", 0) == 0:
+            return {
+                "site_url": site_url,
+                "crawled_count": 0,
+                "extracted_count": 0,
+                "articles": [],
+                "note": "no_articles_found"
+            }
+        
+        # 2단계: 각 글의 본문 추출
+        articles_with_content = []
+        
+        for article in crawl_result.get("articles", []):
+            # 서버 부하 방지를 위한 지연
+            time.sleep(delay_seconds)
+            
+            extract_result = extract_article_content.invoke({"article_url": article["url"]})
+            
+            if extract_result.get("extracted"):
+                articles_with_content.append({
+                    "title": article["title"],
+                    "url": article["url"],
+                    "content": extract_result["content"],
+                    "matched_keywords": article.get("matched_keywords", [])
+                })
+        
+        return {
+            "site_url": site_url,
+            "crawled_count": crawl_result.get("found_count", 0),
+            "extracted_count": len(articles_with_content),
+            "articles": articles_with_content
+        }
+
+
+    @tool("generate_guidance_from_crawled_articles")
+    def generate_guidance_from_crawled_articles(
+        articles: List[Dict[str, Any]],
+        target_type: Optional[str] = None,
+        force_generate: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        크롤링한 글들로부터 보이스피싱 지침을 생성한다.
+        force_generate=True면 무조건 최소 1개 유형 생성
+        
+        입력:
+        - articles: crawl_and_extract_batch의 articles 결과
+        - target_type: 특정 유형으로 한정 (선택)
+        
+        출력:
+        {
+            "guidance": {...},
+            "source_articles": [{title, url}, ...]
+        }
+        """
+        if not articles:
+            return {
+                "guidance": {"types": []},
+                "source_articles": [],
+                "note": "no_articles_provided"
+            }
+
+        
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, timeout=40)
+        
+        # 글 내용 요약
+        article_summaries = []
+        for i, article in enumerate(articles[:15], 1):
+            title = article.get("title", "")
+            content = article.get("content", "")[:1500]  # 각 글당 1500자 제한
+            
+            article_summaries.append(
+                f"{i}. 제목: {title}\n내용: {content}\n"
+            )
+        
+        articles_text = "\n---\n".join(article_summaries)
+        
+        type_instruction = f"특히 '{target_type}' 유형에 집중하라." if target_type else ""
+        
+        prompt = f"""
+    너는 보이스피싱 수법 분석 전문가다.
+    아래는 공식 기관에서 크롤링한 보이스피싱 관련 글들이다.
+
+    중요 지침:
+    1. 글이 직접적인 사례가 아니더라도, 언급된 수법/패턴을 추출하라
+    2. "예방", "주의", "조심" 등의 맥락에서 나온 수법 설명도 포함
+    3. 최소 1개 이상의 유형은 반드시 추출하라
+    4. 구체적 사례가 없으면 일반적인 패턴이라도 정리하라
+
+    {type_instruction}
+
+    출력 형식 (JSON만, 코드블록 없이):
+    {{
+    "types": [
+        {{
+        "type": "유형명 (예: 기관 사칭, 가족 사칭, 대출 사기, AI 음성 사칭 등)",
+        "keywords": ["핵심키워드1", "핵심키워드2", ...],
+        "scenario": [
+            "1단계: 초기 접근 (어떻게 연락하는가)",
+            "2단계: 신뢰 구축 (어떻게 믿게 만드는가)",
+            "3단계: 정보 획득 (무엇을 요구하는가)",
+            "4단계: 압박 전술 (어떻게 급박하게 만드는가)",
+            "5단계: 금전 요구 (돈을 어떻게 빼가는가)"
+        ],
+        "red_flags": [
+            "의심할 수 있는 신호 1",
+            "의심할 수 있는 신호 2",
+            ...
+        ],
+        "recommended_actions": [
+            "즉시 취할 행동 1",
+            "즉시 취할 행동 2",
+            ...
+        ],
+        "real_cases": [
+            "글에서 언급된 사례나 패턴 요약 1",
+            "글에서 언급된 사례나 패턴 요약 2"
+        ]
+        }}
+    ]
+    }}
+
+    규칙:
+    1. types는 최소 1개, 최대 5개
+    2. scenario는 정확히 5단계 (부족하면 일반적 패턴으로 채워라)
+    3. real_cases가 없으면 글에서 언급된 예방법/주의사항이라도 요약
+    4. 글이 보도자료/공지라도 그 안에서 수법 정보 추출
+
+    예시 해석:
+    - "AI 음성으로 보이스피싱 예방" → AI 음성 사칭 수법이 있다는 의미
+    - "가족 사칭 주의" → 가족 사칭 유형 추출
+    - "계좌 이체 요구 조심" → 금전 요구 단계에 포함
+
+    [크롤링한 글들]
+    {articles_text}
+    """.strip()
+        
+        # LLM 호출 전 로깅
+        print(f"\n📊 LLM에 전달할 내용:")
+        print(f"   - 글 개수: {len(articles)}")
+        print(f"   - 총 텍스트 길이: {len(articles_text)} 자")
+        print(f"   - 첫 번째 글 미리보기: {articles[0].get('title', '')[:50]}...")
+        
+        try:
+            response = llm.invoke(prompt).content.strip()
+
+            # 응답 로깅
+            print(f"\n🤖 LLM 응답 미리보기:")
+            print(response[:300] + "...")
+            
+            # JSON 추출
+            if "```json" in response:
+                response = response.split("```json")[1].split("```")[0]
+            elif "```" in response:
+                response = response.split("```")[1].split("```")[0]
+            
+            guidance_data = json.loads(response)
+
+            # types 검증
+            types_list = guidance_data.get("types", [])
+
+            # types가 비어있으면 기본 템플릿
+            if force_generate and len(types_list) == 0:
+                print("⚠️  LLM이 유형을 생성하지 않음 → 강제 생성")
+                
+                # 글 제목에서 키워드 추출
+                all_titles = " ".join([a.get("title", "") for a in articles])
+                extracted_keywords = []
+                
+                keyword_patterns = [
+                    "보이스피싱", "스미싱", "피싱", "메신저", "AI", "음성",
+                    "가족", "검찰", "경찰", "금융", "은행", "대출", "투자"
+                ]
+                
+                for kw in keyword_patterns:
+                    if kw in all_titles:
+                        extracted_keywords.append(kw)
+                # 최소한 언급된 키워드로 1개 유형 생성
+                fallback_type = {
+                    "type": target_type or "보이스피싱 일반",
+                    "keywords": extracted_keywords[:5] or ["보이스피싱"],
+                    "scenario": [
+                        "1단계: 공공기관/금융기관 사칭 전화",
+                        "2단계: 범죄 연루/계좌 문제 등 위기 조성",
+                        "3단계: 개인정보 요구",
+                        "4단계: 즉시 조치 압박",
+                        "5단계: 계좌 이체 또는 앱 설치 유도"
+                    ],
+                    "red_flags": [
+                        "출처 불명 전화/문자",
+                        "긴급 상황 강조",
+                        "개인정보/금융정보 요구"
+                    ],
+                    "recommended_actions": [
+                        "통화 즉시 종료",
+                        "경찰청 182 신고",
+                        "공식 기관 번호로 재확인"
+                    ],
+                    "real_cases": [
+                        f"크롤링한 {len(articles)}개 글에서 언급된 예방법 기반"
+                    ]
+                }
+                
+                guidance_data["types"] = [fallback_type]
+            
+            # 출처 정보 추가
+            source_articles = [
+                {"title": a.get("title", ""), "url": a.get("url", "")}
+                for a in articles[:10]
+            ]
+            
+            return {
+                "guidance": guidance_data,
+                "source_articles": source_articles
+            }
+        
+        except Exception as e:
+            print(f"⚠️  LLM 응답 파싱 실패: {str(e)}")
+        
+            fallback_guidance = {
+                "types": [{
+                    "type": "보이스피싱 일반",
+                    "keywords": ["보이스피싱", "전화금융사기"],
+                    "scenario": [
+                        "1단계: 공공기관 사칭",
+                        "2단계: 위기 상황 조성",
+                        "3단계: 개인정보 요구",
+                        "4단계: 즉시 조치 압박",
+                        "5단계: 금전 요구"
+                    ],
+                    "red_flags": ["출처 불명 연락", "긴급 상황 강조"],
+                    "recommended_actions": ["통화 종료", "경찰 신고"],
+                    "real_cases": [f"{len(articles)}개 글 기반"]
+                }]
+            }
+            
+            return {
+                "guidance": fallback_guidance,
+                "source_articles": [
+                    {"title": a.get("title", ""), "url": a.get("url", "")}
+                    for a in articles[:5]
+                ],
+                "error": str(e)
+            }
+
+    @tool("store_crawled_guidance")
+    def store_crawled_guidance(
+        guidance_data: Dict[str, Any],
+        site_url: str,
+        source_articles: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """
+        크롤링으로 생성한 지침을 DB에 저장한다.
+        
+        입력:
+        - guidance_data: generate_guidance_from_crawled_articles의 guidance
+        - site_url: 크롤링한 사이트 URL
+        - source_articles: 출처 글 목록
+        
+        출력:
+        {"stored": int, "guidance_ids": [str]}
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        stored_ids = []
+        
+        types_list = guidance_data.get("types", [])
+        
+        for type_info in types_list:
+            content = json.dumps(type_info, ensure_ascii=False)
+            guidance_id = _hash_text(content + now)
+            
+            doc = Document(
+                page_content=content,
+                metadata={
+                    "kind": "voicephishing_guidance_crawled_v1",
+                    "phishing_type": type_info.get("type", ""),
+                    "source_site": site_url,
+                    "source_articles_json": json.dumps(source_articles, ensure_ascii=False),
+                    "created_at": now,
+                    "guidance_id": guidance_id,
+                }
+            )
+            
+            vectordb.add_documents([doc])
+            stored_ids.append(guidance_id)
+        
+        return {
+            "stored": len(stored_ids),
+            "guidance_ids": stored_ids
+        }
+    
+    @tool("crawl_site_with_pagination")
+    def crawl_site_with_pagination(
+        site_url: str,
+        keywords: List[str] = None,
+        max_articles: int = 30,
+        max_pages: int = 5,
+        pagination_type: str = "auto",  # auto | url_param | path | next_button
+        page_param: str = "page",  # URL 파라미터 이름
+        delay_seconds: float = 2.0,
+    ) -> Dict[str, Any]:
+        """
+        여러 페이지를 순회하며 보이스피싱 관련 글을 수집한다.
+        
+        입력:
+        - site_url: 첫 페이지 URL
+        - keywords: 필터링 키워드
+        - max_articles: 최대 수집 글 수
+        - max_pages: 최대 탐색 페이지 수
+        - pagination_type: 페이지 넘김 방식
+            * auto: 자동 감지 (URL 패턴 분석)
+            * url_param: ?page=N 형태
+            * path: /notice/N 형태
+            * next_button: "다음" 링크 찾기
+        - page_param: pagination_type=url_param일 때 사용할 파라미터명
+        - delay_seconds: 페이지 간 지연 시간
+        
+        출력:
+        {
+            "site_url": str,
+            "pages_crawled": int,
+            "found_count": int,
+            "articles": [{"title": str, "url": str, "matched_keywords": [str]}, ...]
+        }
+        """
+        if keywords is None:
+            keywords = [
+                "보이스피싱", "전화금융사기", "스미싱", "피싱",
+                "메신저피싱", "사기", "금융사기", "텔레그램"
+            ]
+        
+        all_articles = []
+        current_url = site_url
+        pages_crawled = 0
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        # 페이지네이션 타입 자동 감지
+        if pagination_type == "auto":
+            parsed = urlparse(site_url)
+            if f'{page_param}=' in parsed.query:
+                pagination_type = "url_param"
+            elif re.search(r'/\d+/?$', parsed.path):
+                pagination_type = "path"
+            else:
+                pagination_type = "next_button"
+        
+        for page_num in range(1, max_pages + 1):
+            try:
+                print(f"📄 크롤링 중: 페이지 {page_num}/{max_pages}")
+                
+                # 페이지 URL 생성
+                if pagination_type == "url_param":
+                    # ?page=N 방식
+                    parsed = urlparse(site_url)
+                    query_params = parse_qs(parsed.query)
+                    query_params[page_param] = [str(page_num)]
+                    new_query = urlencode(query_params, doseq=True)
+                    current_url = urlunparse(parsed._replace(query=new_query))
+                    
+                elif pagination_type == "path":
+                    # /notice/N 방식
+                    base_url = re.sub(r'/\d+/?$', '', site_url)
+                    current_url = f"{base_url}/{page_num}"
+                
+                # 페이지 요청
+                response = requests.get(current_url, headers=headers, timeout=15)
+                response.raise_for_status()
+                response.encoding = response.apparent_encoding or 'utf-8'
+                
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # 글 목록 추출 (기존 로직 재사용)
+                items = (
+                    soup.select('tr') or
+                    soup.select('li') or
+                    soup.select('article') or
+                    soup.select('.board-list tr') or
+                    soup.select('.notice-list li')
+                )
+                
+                page_articles = []
+                
+                for item in items:
+                    # 제목 추출
+                    title_elem = (
+                        item.select_one('td.title') or
+                        item.select_one('.title') or
+                        item.select_one('a') or
+                        item.select_one('h3') or
+                        item.select_one('h4')
+                    )
+                    
+                    if not title_elem:
+                        continue
+                    
+                    title = title_elem.get_text(strip=True)
+                    
+                    # 키워드 필터링
+                    matched_keywords = [kw for kw in keywords if kw in title]
+                    if not matched_keywords:
+                        continue
+                    
+                    # 링크 추출
+                    link_elem = title_elem if title_elem.name == 'a' else item.select_one('a')
+                    
+                    if not link_elem:
+                        continue
+                    
+                    href = link_elem.get('href', '')
+                    if not href:
+                        continue
+                    
+                    full_url = urljoin(current_url, href)
+                    
+                    page_articles.append({
+                        "title": title,
+                        "url": full_url,
+                        "matched_keywords": matched_keywords,
+                        "page": page_num
+                    })
+                
+                print(f"   → 발견: {len(page_articles)}개")
+                all_articles.extend(page_articles)
+                pages_crawled += 1
+                
+                # 최대 글 수 도달 시 중단
+                if len(all_articles) >= max_articles:
+                    all_articles = all_articles[:max_articles]
+                    break
+                
+                # 다음 페이지 찾기 (next_button 방식)
+                if pagination_type == "next_button":
+                    next_link = (
+                        soup.select_one('a.next') or
+                        soup.select_one('a[rel="next"]') or
+                        soup.select_one('.pagination a:contains("다음")') or
+                        soup.select_one('.paging a:contains("다음")')
+                    )
+                    
+                    if not next_link:
+                        print("   → 다음 페이지 없음, 종료")
+                        break
+                    
+                    next_href = next_link.get('href', '')
+                    if not next_href:
+                        break
+                    
+                    current_url = urljoin(current_url, next_href)
+                
+                # 글이 없으면 종료
+                if len(page_articles) == 0:
+                    print("   → 글 없음, 종료")
+                    break
+                
+                # 서버 부하 방지
+                time.sleep(delay_seconds)
+                
+            except Exception as e:
+                print(f"   ⚠️  페이지 {page_num} 오류: {str(e)}")
+                break
+        
+        return {
+            "site_url": site_url,
+            "pages_crawled": pages_crawled,
+            "found_count": len(all_articles),
+            "articles": all_articles
+        }
+
+
+    @tool("crawl_and_extract_batch_multi_page")
+    def crawl_and_extract_batch_multi_page(
+        site_url: str,
+        keywords: List[str] = None,
+        max_articles: int = 30,
+        max_pages: int = 5,
+        pagination_type: str = "auto",
+        delay_seconds: float = 2.0,
+    ) -> Dict[str, Any]:
+        """
+        여러 페이지 크롤링 + 본문 추출을 한번에 처리한다.
+        
+        crawl_and_extract_batch의 다중 페이지 버전
+        """
+        # 1단계: 여러 페이지에서 글 목록 수집
+        crawl_result = crawl_site_with_pagination.invoke({
+            "site_url": site_url,
+            "keywords": keywords,
+            "max_articles": max_articles,
+            "max_pages": max_pages,
+            "pagination_type": pagination_type,
+            "delay_seconds": delay_seconds
+        })
+        
+        if crawl_result.get("found_count", 0) == 0:
+            return {
+                "site_url": site_url,
+                "pages_crawled": 0,
+                "crawled_count": 0,
+                "extracted_count": 0,
+                "articles": [],
+                "note": "no_articles_found"
+            }
+        
+        # 2단계: 본문 추출
+        articles_with_content = []
+        
+        print(f"\n📝 본문 추출 시작: {crawl_result.get('found_count')}개 글")
+        
+        for i, article in enumerate(crawl_result.get("articles", []), 1):
+            print(f"   {i}/{crawl_result.get('found_count')}: {article['title'][:30]}...")
+            
+            time.sleep(delay_seconds)
+            
+            extract_result = extract_article_content.invoke({"article_url": article["url"]})
+            
+            if extract_result.get("extracted"):
+                articles_with_content.append({
+                    "title": article["title"],
+                    "url": article["url"],
+                    "content": extract_result["content"],
+                    "matched_keywords": article["matched_keywords"],
+                    "page": article.get("page", 1)
+                })
+        
+        print(f"✅ 본문 추출 완료: {len(articles_with_content)}개")
+        
+        return {
+            "site_url": site_url,
+            "pages_crawled": crawl_result.get("pages_crawled", 0),
+            "crawled_count": crawl_result.get("found_count", 0),
+            "extracted_count": len(articles_with_content),
+            "articles": articles_with_content
+        }
+    
+    # -----------------------------
+    # 기존 함수들
     # -----------------------------
     @tool("vector_search")
     def vector_search(
@@ -766,4 +1893,24 @@ def build_tools(vectordb: Chroma) -> List[Any]:
         col.update(ids=doc_ids, metadatas=new_metas)
         return {"updated": len(doc_ids), "report_id": report_id}
 
-    return [vector_search, web_search_snippets, web_fetch_and_store, web_search, report_write_and_store, store_snippets_only, load_collected_snippets, write_report_from_snippets_and_store, mark_snippets_processed]
+    return [vector_search, 
+            web_search_snippets, 
+            web_fetch_and_store, 
+            web_search, 
+            report_write_and_store, 
+            store_snippets_only, 
+            load_collected_snippets, 
+            write_report_from_snippets_and_store, 
+            mark_snippets_processed,
+            generate_targeted_guidance,
+            store_guidance_to_db,
+            search_existing_guidance,
+            # 크롤링 도구 추가
+            crawl_site_for_phishing_cases,
+            extract_article_content,
+            crawl_and_extract_batch,
+            crawl_site_with_pagination,
+            crawl_and_extract_batch_multi_page,
+            generate_guidance_from_crawled_articles,
+            store_crawled_guidance
+            ]

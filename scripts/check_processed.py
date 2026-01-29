@@ -1,4 +1,5 @@
 # scripts/check_processed.py
+# “요약에 쓰인 스니펫이 processed=True로 바뀌었는지” 확인 스크립트
 import json
 from langchain_openai import OpenAIEmbeddings
 from app.tools.store import get_chroma
