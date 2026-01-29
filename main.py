@@ -5,9 +5,7 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 import uvicorn
 
-from app.orchestrator_guidance import build_guidance_orchestrator
-from app.orchestrator_crawl import build_crawl_orchestrator
-from app.orchestrator_unified import build_unified_orchestrator
+from app.orchestrator_attack import build_attack_enhancement_orchestrator
 
 # FastAPI 앱 생성
 app = FastAPI(
@@ -27,9 +25,7 @@ app.add_middleware(
 
 # Orchestrator 초기화
 print("🚀 Initializing orchestrators...")
-guidance_orch = build_guidance_orchestrator(model_name="gpt-4o")
-crawl_orch = build_crawl_orchestrator(model_name="gpt-4o")
-unified_orch = build_unified_orchestrator(model_name="gpt-4o")
+attack_orch = build_attack_enhancement_orchestrator(model_name="gpt-4o")
 print("✅ Orchestrators ready!")
 
 
@@ -98,6 +94,16 @@ class CrawlResponse(BaseModel):
     guidance: Optional[Dict[str, Any]] = None
     source_articles: Optional[List[Dict[str, str]]] = []
 
+class AttackEnhancementRequest(BaseModel):
+    """공격 강화 분석 요청"""
+    conversation_summary: str
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "conversation_summary": "피해자는 30대 중후반 남자 직장인이다. 피싱범은 전화로 연락해 공식 기관 소속을 내세워 신뢰를 얻으려 한다..."
+            }
+        }
 
 # ==================== API 엔드포인트 ====================
 
@@ -127,128 +133,26 @@ async def health_check():
     }
 
 
-@app.post("/api/guidance", response_model=GuidanceResponse)
-async def get_phishing_guidance(request: GuidanceRequest):
+@app.post("/api/attack/enhance")
+async def enhance_attack_scenario(request: AttackEnhancementRequest):
     """
-    보이스피싱 지침 요청
+    대화 요약 분석 → 취약점 파악 → 강화 수법 생성
     
-    - **DB에 있으면**: 기존 지침 반환
-    - **없으면**: 웹 검색 → 생성 → 저장 → 반환
-    
-    **Request Body:**
-```json
-    {
-        "phishing": true,
-        "type": "검경 사칭",
-        "scenario": "검찰 사칭해서 현금 편취",
-        "victim_profile": {
-            "age": 65,
-            "occupation": "퇴직자"
-        }
-    }
-```
-    
-    **Response:**
-```json
-    {
-        "status": "found_in_db" | "generated_new",
-        "guidance": {
-            "type": "검경 사칭",
-            "keywords": [...],
-            "scenario": [...],
-            "red_flags": [...],
-            "recommended_actions": [...]
-        },
-        "guidance_id": "...",
-        "source": "database" | "web_search"
-    }
-```
+    **Process:**
+    1. 피해자 프로필 추출
+    2. 취약점 질문 생성
+    3. 웹 검색 (심리학/사회학 관점)
+    4. 수법 10개 생성
+    5. 적합한 수법 3개 이상 선택
+    6. 최종 리포트 작성
     """
     try:
-        result = guidance_orch.handle(request.dict())
+        result = attack_orch.handle(request.dict())
         
         if result.get("status") == "error":
             raise HTTPException(
                 status_code=500,
-                detail=result.get("message", "Unknown error")
-            )
-        
-        return result
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/crawl", response_model=CrawlResponse)
-async def crawl_site_for_guidance(request: CrawlRequest):
-    """
-    특정 사이트 크롤링 → 지침 생성
-    
-    - 목록 페이지에서 보이스피싱 관련 글 필터링
-    - 각 글의 본문 추출
-    - LLM으로 지침 생성
-    - DB에 저장
-    
-    **Request Body:**
-```json
-    {
-        "site_url": "https://www.kisa.or.kr/402?page=1",
-        "keywords": ["보이스피싱", "스미싱"],
-        "max_articles": 20,
-        "max_pages": 3,
-        "pagination_type": "auto",
-        "target_type": null
-    }
-```
-    
-    **Response:**
-```json
-    {
-        "status": "success",
-        "site_url": "...",
-        "pages_crawled": 3,
-        "crawled_count": 20,
-        "extracted_count": 18,
-        "types_generated": 3,
-        "guidance_ids": ["...", "...", "..."],
-        "guidance": {...},
-        "source_articles": [...]
-    }
-```
-    """
-    try:
-        result = crawl_orch.handle(request.dict())
-        
-        if result.get("status") == "error":
-            raise HTTPException(
-                status_code=500,
-                detail=result.get("message", "Unknown error")
-            )
-        
-        return result
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# 병합 엔드포인트
-@app.post("/api/guidance/unified")
-async def get_phishing_guidance_unified(request: GuidanceRequest):
-    """
-    **통합 지침 API** (권장)
-    
-    1. DB 검색
-    2. 없으면 → 웹 검색 + 사이트 크롤링 동시 실행
-    3. 결과 통합 → 지침 생성 → 저장 → 반환
-    
-    기존 `/api/guidance`보다 더 많은 출처로 정확한 지침 제공
-    """
-    try:
-        result = unified_orch.handle(request.dict())
-        
-        if result.get("status") == "error":
-            raise HTTPException(
-                status_code=500,
-                detail=result.get("message", "Unknown error")
+                detail=result.get("message")
             )
         
         return result

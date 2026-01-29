@@ -1,11 +1,11 @@
-# app/orchestrator_unified.py
+# app/orchestrator_attack.py
 from __future__ import annotations
 
 import json
 from typing import Any, Dict, Optional
 from langchain_openai import OpenAIEmbeddings
 
-from app.agent_graph_unified import build_unified_agent_graph
+from app.agent_graph_attack import build_attack_enhancement_agent_graph
 from app.tools.store import get_chroma
 
 try:
@@ -14,14 +14,14 @@ except Exception:
     SETTINGS = None
 
 
-class UnifiedOrchestrator:
+class AttackEnhancementOrchestrator:
     def __init__(self, app):
         self.app = app
     
     def handle(self, request: Dict[str, Any], thread_id: Optional[str] = None) -> Dict[str, Any]:
-        """통합 요청 처리"""
+        """공격 강화 분석 요청 처리"""
         if thread_id is None:
-            thread_id = f"unified_{request.get('type', 'unknown')}"
+            thread_id = f"attack_{hash(request.get('conversation_summary', ''))}"
         
         input_text = json.dumps(request, ensure_ascii=False)
         
@@ -54,12 +54,12 @@ class UnifiedOrchestrator:
         return {"status": "error", "message": "No response"}
 
 
-def build_unified_orchestrator(model_name: Optional[str] = None) -> UnifiedOrchestrator:
+def build_attack_enhancement_orchestrator(model_name: Optional[str] = None) -> AttackEnhancementOrchestrator:
     embeddings = OpenAIEmbeddings()
     vectordb = get_chroma(embeddings)
     
     if model_name is None and SETTINGS is not None:
         model_name = getattr(SETTINGS, "model_name", None)
     
-    app = build_unified_agent_graph(vectordb=vectordb, model_name=model_name)
-    return UnifiedOrchestrator(app)
+    app = build_attack_enhancement_agent_graph(vectordb=vectordb, model_name=model_name)
+    return AttackEnhancementOrchestrator(app)

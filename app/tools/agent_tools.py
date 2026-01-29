@@ -23,6 +23,15 @@ from langchain_openai import ChatOpenAI
 
 from langchain_tavily import TavilySearch, TavilyExtract
 
+from app.tools.agent_tools_attack import (
+    analyze_conversation_summary,
+    generate_search_queries_from_question,
+    search_vulnerability_info,
+    generate_attack_techniques,
+    filter_and_select_techniques,
+    create_attack_enhancement_report,
+)
+
 
 def _hash_text(text: str) -> str:
     return sha256(text.encode("utf-8", errors="ignore")).hexdigest()
@@ -2203,5 +2212,12 @@ def build_tools(vectordb: Chroma) -> List[Any]:
             generate_guidance_from_crawled_articles,
             store_crawled_guidance,
             search_and_crawl_combined,
-            generate_unified_guidance
+            generate_unified_guidance,
+            # 공격 강화 도구들
+            analyze_conversation_summary,
+            generate_search_queries_from_question,
+            search_vulnerability_info,
+            generate_attack_techniques,
+            filter_and_select_techniques,
+            create_attack_enhancement_report,
             ]
