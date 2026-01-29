@@ -7,6 +7,7 @@ import uvicorn
 
 from app.orchestrator_guidance import build_guidance_orchestrator
 from app.orchestrator_crawl import build_crawl_orchestrator
+from app.orchestrator_unified import build_unified_orchestrator
 
 # FastAPI 앱 생성
 app = FastAPI(
@@ -28,6 +29,7 @@ app.add_middleware(
 print("🚀 Initializing orchestrators...")
 guidance_orch = build_guidance_orchestrator(model_name="gpt-4o")
 crawl_orch = build_crawl_orchestrator(model_name="gpt-4o")
+unified_orch = build_unified_orchestrator(model_name="gpt-4o")
 print("✅ Orchestrators ready!")
 
 
@@ -228,6 +230,31 @@ async def crawl_site_for_guidance(request: CrawlRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# 병합 엔드포인트
+@app.post("/api/guidance/unified")
+async def get_phishing_guidance_unified(request: GuidanceRequest):
+    """
+    **통합 지침 API** (권장)
+    
+    1. DB 검색
+    2. 없으면 → 웹 검색 + 사이트 크롤링 동시 실행
+    3. 결과 통합 → 지침 생성 → 저장 → 반환
+    
+    기존 `/api/guidance`보다 더 많은 출처로 정확한 지침 제공
+    """
+    try:
+        result = unified_orch.handle(request.dict())
+        
+        if result.get("status") == "error":
+            raise HTTPException(
+                status_code=500,
+                detail=result.get("message", "Unknown error")
+            )
+        
+        return result
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ==================== 서버 실행 ====================
 

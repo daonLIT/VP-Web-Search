@@ -1163,6 +1163,295 @@ def build_tools(vectordb: Chroma) -> List[Any]:
             "articles": articles_with_content
         }
     
+    @tool("search_and_crawl_combined")
+    def search_and_crawl_combined(
+        phishing_type: str,
+        scenario: str,
+        victim_profile: Optional[Dict[str, Any]] = None,
+        crawl_sites: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        웹 검색 + 사이트 크롤링을 동시에 수행하여 최대한 많은 정보를 수집한다.
+        
+        입력:
+        - phishing_type: 보이스피싱 유형
+        - scenario: 시나리오
+        - victim_profile: 피해자 프로필
+        - crawl_sites: 크롤링할 사이트 목록 (없으면 기본 사이트들)
+        
+        출력:
+        {
+            "web_search_results": [...],
+            "crawled_articles": [...],
+            "total_sources": int
+        }
+        """
+        # 기본 크롤링 사이트 목록
+        if crawl_sites is None:
+            crawl_sites = [
+                "https://www.kisa.or.kr/402?page=1&searchDiv=10&searchWord=피싱",
+                "https://www.police.go.kr/www/open/publice/publice0202.jsp",
+            ]
+        
+        print(f"\n🔍 통합 검색 시작: {phishing_type}")
+        
+        # === 1. 웹 검색 (Tavily) ===
+        print("📡 Tavily 웹 검색 중...")
+        web_results = []
+
+        from langchain_tavily import TavilySearch
+
+        tavily = TavilySearch(
+            max_results=5,
+            topic="general",
+            include_answer=True,
+            include_raw_content=False,
+            search_depth="basic",
+        )
+        
+        queries = [
+            f"보이스피싱 {phishing_type} 수법",
+            f"{phishing_type} {scenario}",
+        ]
+        
+        if victim_profile and victim_profile.get("age"):
+            queries.append(f"{phishing_type} {victim_profile['age']}대 피해")
+        
+        for query in queries[:3]:
+            try:
+                args = {
+                    "query": query,
+                    "topic": "news",
+                    "max_results": 5,
+                    "time_range": "month"
+                }
+                raw_out = tavily.invoke(args)
+                results = _normalize_tavily_search_output(raw_out)
+                
+                for r in results:
+                    url = (r.get("url") or "").strip()
+                    if url and not _is_hub_url(url):
+                        web_results.append({
+                            "title": r.get("title", "")[:100],
+                            "url": url,
+                            "content": (r.get("content") or "")[:800],
+                            "source": "web_search"
+                        })
+            except Exception as e:
+                print(f"   ⚠️ 웹 검색 오류: {str(e)}")
+        
+        print(f"   ✅ 웹 검색 완료: {len(web_results)}개")
+        
+        # === 2. 사이트 크롤링 ===
+        print(f"🕷️  사이트 크롤링 중 ({len(crawl_sites)}개 사이트)...")
+        crawled_articles = []
+        
+        for site_url in crawl_sites:
+            try:
+                # 각 사이트별로 간단히 크롤링 (1페이지, 최대 5개)
+                crawl_result = crawl_and_extract_batch_multi_page.invoke({
+                    "site_url": site_url,
+                    "keywords": ["보이스피싱", phishing_type, "사기", "피싱"],
+                    "max_articles": 5,
+                    "max_pages": 1,
+                    "delay_seconds": 1.0
+                })
+                
+                articles = crawl_result.get("articles", [])
+                for article in articles:
+                    article["source"] = "crawl"
+                
+                crawled_articles.extend(articles)
+                print(f"   ✅ {site_url[:40]}...: {len(articles)}개")
+                
+            except Exception as e:
+                print(f"   ⚠️ {site_url[:40]}... 오류: {str(e)}")
+        
+        print(f"   ✅ 크롤링 완료: {len(crawled_articles)}개")
+        
+        # === 3. 결과 통합 ===
+        total_sources = len(web_results) + len(crawled_articles)
+        
+        return {
+            "web_search_results": web_results[:10],  # 최대 10개
+            "crawled_articles": crawled_articles[:10],  # 최대 10개
+            "total_sources": total_sources
+        }
+
+
+    @tool("generate_unified_guidance")
+    def generate_unified_guidance(
+        phishing_type: str,
+        scenario: str,
+        web_results: List[Dict[str, Any]],
+        crawled_articles: List[Dict[str, Any]],
+        victim_profile: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        웹 검색 결과 + 크롤링 결과를 통합하여 최종 지침을 생성한다.
+        
+        입력:
+        - phishing_type: 유형
+        - scenario: 시나리오
+        - web_results: Tavily 웹 검색 결과
+        - crawled_articles: 크롤링한 글들
+        - victim_profile: 피해자 프로필
+        
+        출력:
+        {
+            "guidance": {...},
+            "sources": [{title, url, source_type}, ...]
+        }
+        """
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, timeout=40)
+        
+        print(f"\n🤖 LLM으로 통합 지침 생성 중...")
+        
+        # === 웹 검색 결과 정리 ===
+        web_text = []
+        for i, item in enumerate(web_results[:8], 1):
+            web_text.append(
+                f"[웹검색 {i}] {item.get('title', '')}\n"
+                f"URL: {item.get('url', '')}\n"
+                f"내용: {item.get('content', '')}\n"
+            )
+        
+        # === 크롤링 결과 정리 ===
+        crawl_text = []
+        for i, item in enumerate(crawled_articles[:8], 1):
+            crawl_text.append(
+                f"[크롤링 {i}] {item.get('title', '')}\n"
+                f"URL: {item.get('url', '')}\n"
+                f"내용: {item.get('content', '')[:1000]}\n"
+            )
+        
+        victim_ctx = ""
+        if victim_profile:
+            victim_ctx = f"\n\n피해자 특성:\n{json.dumps(victim_profile, ensure_ascii=False, indent=2)}"
+        
+        prompt = f"""
+    너는 보이스피싱 수법 분석 전문가다.
+
+    아래는 '{phishing_type}' 유형에 대한 정보를 두 가지 경로로 수집한 결과다:
+    1. **웹 검색**: 최신 뉴스/기사 스니펫
+    2. **사이트 크롤링**: 공식 기관 게시판의 상세 글
+
+    시나리오: {scenario}{victim_ctx}
+
+    이 정보들을 종합하여 **실전에 바로 활용 가능한** 상세 지침을 JSON으로 작성하라.
+
+    출력 형식 (JSON만, 코드블록 없이):
+    {{
+    "type": "{phishing_type}",
+    "keywords": ["핵심키워드1", "핵심키워드2", ...],
+    "scenario": [
+        "1단계: 초기 접근 (구체적 방법)",
+        "2단계: 신뢰 구축 (사용하는 말투/증거)",
+        "3단계: 정보 수집 (요구하는 정보)",
+        "4단계: 압박 전술 (위협/긴급성)",
+        "5단계: 금전 요구 (구체적 방법)",
+        "6단계: 추가 피해 (2차 피해 패턴)"
+    ],
+    "red_flags": [
+        "의심 신호 1 (구체적)",
+        "의심 신호 2 (구체적)",
+        ...
+    ],
+    "recommended_actions": [
+        "즉시 행동 1 (구체적)",
+        "즉시 행동 2 (구체적)",
+        ...
+    ],
+    "real_cases": [
+        "실제 사례 요약 1",
+        "실제 사례 요약 2"
+    ],
+    "prevention_tips": [
+        "예방 팁 1",
+        "예방 팁 2"
+    ]
+    }}
+
+    중요 규칙:
+    1. 웹 검색과 크롤링 결과를 **모두 활용**하라
+    2. scenario는 정확히 6단계, 각 단계는 구체적으로
+    3. 피해자 특성을 고려한 맞춤형 내용
+    4. real_cases는 실제 언급된 사례 기반
+    5. 추측 금지, 제공된 정보만 사용
+
+    === 웹 검색 결과 ({len(web_results)}개) ===
+    {chr(10).join(web_text)}
+
+    === 크롤링 결과 ({len(crawled_articles)}개) ===
+    {chr(10).join(crawl_text)}
+    """.strip()
+        
+        try:
+            response = llm.invoke(prompt).content.strip()
+            
+            # JSON 추출
+            if "```json" in response:
+                response = response.split("```json")[1].split("```")[0]
+            elif "```" in response:
+                response = response.split("```")[1].split("```")[0]
+            
+            guidance = json.loads(response)
+            
+            # 출처 정리
+            sources = []
+            
+            for item in web_results[:5]:
+                sources.append({
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "source_type": "web_search"
+                })
+            
+            for item in crawled_articles[:5]:
+                sources.append({
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "source_type": "crawl"
+                })
+            
+            guidance["sources"] = sources
+            
+            print(f"   ✅ 지침 생성 완료")
+            
+            return {
+                "guidance": guidance,
+                "sources": sources,
+                "web_sources_count": len(web_results),
+                "crawl_sources_count": len(crawled_articles)
+            }
+        
+        except Exception as e:
+            print(f"   ⚠️ 생성 실패: {str(e)}")
+            
+            # Fallback
+            return {
+                "guidance": {
+                    "type": phishing_type,
+                    "keywords": [phishing_type, scenario],
+                    "scenario": [
+                        "1단계: 공공기관/금융기관 사칭 연락",
+                        "2단계: 범죄 연루 등 허위 사실 고지",
+                        "3단계: 개인정보 요구",
+                        "4단계: 긴급 조치 압박",
+                        "5단계: 금전 요구",
+                        "6단계: 2차 피해 시도"
+                    ],
+                    "red_flags": ["출처 불명", "급박한 상황"],
+                    "recommended_actions": ["통화 종료", "경찰 신고"],
+                    "real_cases": [],
+                    "prevention_tips": []
+                },
+                "sources": [],
+                "error": str(e)
+            }
+        
+    
+    
     # -----------------------------
     # 기존 함수들
     # -----------------------------
@@ -1912,5 +2201,7 @@ def build_tools(vectordb: Chroma) -> List[Any]:
             crawl_site_with_pagination,
             crawl_and_extract_batch_multi_page,
             generate_guidance_from_crawled_articles,
-            store_crawled_guidance
+            store_crawled_guidance,
+            search_and_crawl_combined,
+            generate_unified_guidance
             ]
