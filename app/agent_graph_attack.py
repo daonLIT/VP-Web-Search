@@ -24,10 +24,12 @@ SYSTEM_PROMPT_ATTACK = """\
 
 2) 각 vulnerability_question에 대해:
    a) generate_search_queries_from_question(question=..., victim_profile=...)
-   b) search_vulnerability_info(search_queries=...)
+   b) search_vulnerability_info(search_queries=..., extract_full_content=true) 
+      → 본문까지 추출된 결과 반환
+
 
 3) generate_attack_techniques(
-     vulnerability_info=모든 검색 결과,
+     vulnerability_info=모든 검색 결과 (전체 본문 포함),
      victim_profile=...,
      current_scenario=...,
      victim_suspicion_points=...
@@ -68,12 +70,16 @@ def build_attack_enhancement_agent_graph(vectordb, model_name: Optional[str] = N
         "analyze_conversation_summary",
         "generate_search_queries_from_question",
         "search_vulnerability_info",
+      #   "search_and_extract_vulnerability_info",
         "generate_attack_techniques",
         "filter_and_select_techniques",
         "create_attack_enhancement_report",
     }
     
     tools = [t for t in all_tools if t.name in allow]
+
+    if len(tools) < 6:
+        raise RuntimeError(f"Missing tools. Found: {[t.name for t in tools]}")
     
     llm = ChatOpenAI(
         model=(model_name or "gpt-4o"),

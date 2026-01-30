@@ -30,6 +30,7 @@ from app.tools.agent_tools_attack import (
     generate_attack_techniques,
     filter_and_select_techniques,
     create_attack_enhancement_report,
+    # search_and_extract_vulnerability_info,
 )
 
 
@@ -2220,4 +2221,5 @@ def build_tools(vectordb: Chroma) -> List[Any]:
             generate_attack_techniques,
             filter_and_select_techniques,
             create_attack_enhancement_report,
+            # search_and_extract_vulnerability_info,
             ]
