@@ -82,7 +82,7 @@ def build_attack_enhancement_agent_graph(vectordb, model_name: Optional[str] = N
         raise RuntimeError(f"Missing tools. Found: {[t.name for t in tools]}")
     
     llm = ChatOpenAI(
-        model=(model_name or "gpt-4o"),
+        model=(model_name or "gpt-4o-mini"),
         temperature=0,
         timeout=180,
         max_retries=3,

@@ -42,7 +42,7 @@ def analyze_conversation_summary(
         ]
     }
     """
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.3, timeout=30)
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3, timeout=30)
     
     prompt = f"""
 너는 보이스피싱 대화를 분석하는 전문가다.
@@ -497,7 +497,7 @@ def generate_attack_techniques(
 ) -> List[Dict[str, Any]]:
     """수집된 취약점 정보를 바탕으로 강화된 공격 수법 10개를 생성"""
     
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.7, timeout=60)
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7, timeout=60)
     
     # 검색 결과가 너무 적으면 경고
     if len(vulnerability_info) < 3:

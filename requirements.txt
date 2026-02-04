@@ -13,5 +13,5 @@ langsmith
 
 fastapi==0.108.0
 uvicorn[standard]==0.25.0
-pydantic==2.5.0
+pydantic==2.7.4
 python-multipart==0.0.6

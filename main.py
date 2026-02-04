@@ -164,16 +164,16 @@ async def enhance_attack_scenario(request: AttackEnhancementRequest):
 
 if __name__ == "__main__":
     print("\n" + "="*60)
-    print("🎯 VoicePhishing Intelligence API Server")
+    print("🎯 VoicePhishing Intelligence API Server (Web Search)")
     print("="*60)
-    print("📍 Server: http://localhost:8000")
-    print("📚 Docs: http://localhost:8000/docs")
-    print("🔍 Health: http://localhost:8000/health")
+    print("📍 Server: http://localhost:8001")
+    print("📚 Docs: http://localhost:8001/docs")
+    print("🔍 Health: http://localhost:8001/health")
     print("="*60 + "\n")
-    
+
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=8000,
+        port=8001,  # 기존 시스템(8000)과 분리
         log_level="info"
     )
