@@ -1,11 +1,17 @@
-langgraph
+langchain==1.2.7
 langchain-core
 langchain-community
+langchain-openai
 langchain-chroma
 chromadb
+langgraph==1.0.7
+langgraph-prebuilt
+langchain-tavily
 tavily-python
 python-dotenv
+langsmith
 
-# 선택: 요약/정리를 LLM으로 하려면
-langchain-openai
-openai
+fastapi==0.108.0
+uvicorn[standard]==0.25.0
+pydantic==2.5.0
+python-multipart==0.0.6
