@@ -170,6 +170,117 @@ class HealthResponse(BaseModel):
     version: str
 
 
+# ==================== VP2 연동 스키마 ====================
+
+class JudgementRequest(BaseModel):
+    """
+    VP2에서 전송하는 판정+대화 데이터
+    - 감정 라벨이 제거된 순수 대화 내용
+    - 판정 결과 포함
+    """
+    case_id: str = Field(..., description="케이스 ID")
+    round_no: int = Field(..., ge=1, description="라운드 번호")
+    turns: List[Dict[str, Any]] = Field(
+        ...,
+        description="대화 턴 목록 (감정 라벨 제거됨)"
+    )
+    judgement: Dict[str, Any] = Field(
+        ...,
+        description="판정 결과 (phishing, risk, evidence 등)"
+    )
+    scenario: Optional[Dict[str, Any]] = Field(
+        default_factory=dict,
+        description="시나리오 정보"
+    )
+    victim_profile: Optional[Dict[str, Any]] = Field(
+        default_factory=dict,
+        description="피해자 프로필"
+    )
+    timestamp: Optional[str] = Field(
+        default=None,
+        description="전송 시각"
+    )
+    source: Optional[str] = Field(
+        default="judgement_trigger",
+        description="전송 출처"
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "case_id": "550e8400-e29b-41d4-a716-446655440000",
+                "round_no": 1,
+                "turns": [
+                    {"role": "offender", "text": "안녕하세요, 검찰청입니다.", "turn_index": 0},
+                    {"role": "victim", "text": "네, 안녕하세요.", "turn_index": 1}
+                ],
+                "judgement": {
+                    "phishing": False,
+                    "evidence": "피해자가 의심하고 있음",
+                    "risk": {"score": 25, "level": "low", "rationale": "..."},
+                    "victim_vulnerabilities": ["권위에 약함"]
+                },
+                "scenario": {"type": "검찰사칭"},
+                "victim_profile": {"age_group": "60대"}
+            }
+        }
+
+
+class JudgementResponse(BaseModel):
+    """판정 수신 응답"""
+    ok: bool = True
+    received_id: str = Field(..., description="수신 ID")
+    case_id: str = Field(..., description="케이스 ID")
+    round_no: int = Field(..., description="라운드 번호")
+    turns_count: int = Field(..., description="수신된 턴 수")
+    message: str = Field(default="판정 데이터 수신 완료")
+    analysis_triggered: bool = Field(
+        default=False,
+        description="분석 트리거 여부"
+    )
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+
+class ConversationRequest(BaseModel):
+    """
+    VP2에서 전송하는 대화 데이터 (기존 호환)
+    """
+    case_id: str = Field(..., description="케이스 ID")
+    round_no: int = Field(..., ge=1, description="라운드 번호")
+    turns: List[Dict[str, Any]] = Field(..., description="대화 턴 목록")
+    scenario: Dict[str, Any] = Field(default_factory=dict)
+    victim_profile: Dict[str, Any] = Field(default_factory=dict)
+    guidance: Dict[str, Any] = Field(default_factory=dict)
+    judgement: Optional[Dict[str, Any]] = Field(default=None)
+    timestamp: Optional[str] = Field(default=None)
+
+
+class ConversationResponse(BaseModel):
+    """대화 수신 응답"""
+    ok: bool = True
+    received_id: str
+    message: Optional[str] = None
+
+
+class MethodReportRequest(BaseModel):
+    """수법 리포트 요청"""
+    case_id: str = Field(..., description="케이스 ID")
+    scenario_type: str = Field(..., description="시나리오 유형")
+    keywords: List[str] = Field(default_factory=list)
+    conversation_summary: Optional[str] = Field(default=None)
+    request_time: Optional[str] = Field(default=None)
+
+
+class MethodReportResponse(BaseModel):
+    """수법 리포트 응답"""
+    report_id: str
+    new_methods: List[Dict[str, Any]] = Field(default_factory=list)
+    sources: List[str] = Field(default_factory=list)
+    summary: str = ""
+    recommendations: List[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 # Export
 __all__ = [
     "AnalysisType",
@@ -182,4 +293,11 @@ __all__ = [
     "AnalysisReport",
     "AnalysisResponse",
     "HealthResponse",
+    # VP2 연동
+    "JudgementRequest",
+    "JudgementResponse",
+    "ConversationRequest",
+    "ConversationResponse",
+    "MethodReportRequest",
+    "MethodReportResponse",
 ]

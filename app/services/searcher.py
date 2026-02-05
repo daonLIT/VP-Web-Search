@@ -114,16 +114,25 @@ class WebSearcher:
         for query in queries:
             try:
                 raw_out = self.tavily.invoke({"query": query})
+                logger.debug(f"Tavily raw output type: {type(raw_out)}, content: {str(raw_out)[:200]}")
 
                 # 결과 정규화
+                results = []
                 if isinstance(raw_out, dict):
                     results = raw_out.get("results", [])
                 elif isinstance(raw_out, list):
                     results = raw_out
-                else:
-                    results = []
+                elif isinstance(raw_out, str):
+                    # 문자열인 경우 그대로 사용
+                    logger.info(f"Tavily returned string for '{query}': {raw_out[:200]}")
+                    continue
 
                 for r in results[:self.max_results_per_query]:
+                    # r이 None이거나 dict가 아니면 스킵
+                    if not r or not isinstance(r, dict):
+                        logger.warning(f"Invalid result item: {r}")
+                        continue
+
                     url = (r.get("url") or "").strip()
                     if url:
                         all_items.append({
@@ -133,10 +142,10 @@ class WebSearcher:
                             "query": query,
                         })
 
-                logger.debug(f"Query '{query}': {len(results)} results")
+                logger.info(f"Query '{query}': {len(results)} results, {len([i for i in all_items if i['query']==query])} valid")
 
             except Exception as e:
-                logger.error(f"Search failed for '{query}': {e}")
+                logger.error(f"Search failed for '{query}': {e}", exc_info=True)
 
         return all_items
 

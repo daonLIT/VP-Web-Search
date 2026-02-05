@@ -105,7 +105,7 @@ def search_node(state: ResearchState) -> ResearchState:
 
         # 검색 설정
         request = state["request"]
-        search_config = request.get("search_config", {})
+        search_config = request.get("search_config") or {}
 
         searcher = WebSearcher(
             max_results_per_query=search_config.get("max_results_per_query", 3),
@@ -132,7 +132,7 @@ def search_node(state: ResearchState) -> ResearchState:
         }
 
     except Exception as e:
-        logger.error(f"Search failed: {e}")
+        logger.error(f"Search failed: {e}", exc_info=True)
         return {**state, "search_results": [], "error": str(e)}
 
 
@@ -179,29 +179,32 @@ def generate_techniques_node(state: ResearchState) -> ResearchState:
         vulnerabilities_str = "\n".join(f"- {v}" for v in (analysis.vulnerability_areas if analysis else []))
 
         prompt = f"""
-당신은 심리/사회 분석 전문가입니다.
-수집된 정보를 바탕으로 취약점 대응 기법 10개를 생성하세요.
+당신은 보이스피싱 시뮬레이션 시스템의 공격 수법 생성 전문가입니다.
+이 시스템은 보이스피싱 대응 훈련을 위해 피해자의 취약점을 공략하는 새로운 공격 수법을 생성합니다.
+생성된 수법은 다른 시스템에서 대응책을 마련하는 데 활용됩니다.
 
-[프로필 정보]
+[피해자 프로필]
 {profile_str}
 
-[감지된 시나리오]
+[현재 시나리오]
 {scenario_str}
 
-[취약 영역]
+[피해자 취약점]
 {vulnerabilities_str}
 
-[수집된 정보 ({len(search_results)}건)]
+[웹 검색으로 수집된 최신 보이스피싱 수법 정보 ({len(search_results)}건)]
 {chr(10).join(search_summary)}
 
-다음 JSON 형식으로 정확히 10개의 기법을 출력하세요:
+위 정보를 바탕으로, 피해자의 취약점을 공략할 수 있는 새로운 공격 수법 10개를 생성하세요.
+
+다음 JSON 형식으로 정확히 10개의 공격 수법을 출력하세요:
 {{
     "techniques": [
         {{
-            "name": "기법 이름",
-            "description": "기법 설명",
-            "application": "적용 방법",
-            "expected_effect": "예상 효과",
+            "name": "공격 수법 이름 (예: 긴급성 강조 화법)",
+            "description": "수법에 대한 상세 설명",
+            "application": "피해자에게 어떻게 적용하는지 구체적인 대화 예시 포함",
+            "expected_effect": "피해자가 어떤 심리적 반응을 보일지, 왜 효과적인지",
             "fit_score": 0.85
         }},
         ...
@@ -210,9 +213,10 @@ def generate_techniques_node(state: ResearchState) -> ResearchState:
 
 규칙:
 1. 정확히 10개 생성
-2. fit_score는 0.0~1.0 (현실적으로 평가)
-3. 수집된 정보를 구체적으로 활용
-4. JSON만 출력 (마크다운 없이)
+2. fit_score는 해당 피해자에게 얼마나 효과적일지 0.0~1.0로 평가
+3. 수집된 최신 수법 정보를 구체적으로 활용하여 새로운 변형 수법 생성
+4. 피해자의 취약점(나이, 직업, 심리적 특성)에 맞춤화
+5. JSON만 출력 (마크다운 없이)
 """.strip()
 
         response = llm.invoke(prompt).content.strip()
@@ -295,24 +299,24 @@ def create_report_node(state: ResearchState) -> ResearchState:
 """
 
         prompt = f"""
-당신은 리포트 작성 전문가입니다.
-분석 결과를 바탕으로 최종 리포트를 작성하세요.
+당신은 보이스피싱 시뮬레이션 시스템의 공격 전략 리포트 작성 전문가입니다.
+생성된 공격 수법을 정리하여 시뮬레이션에서 활용할 수 있는 리포트를 작성하세요.
 
-[요약]
+[대화 분석 요약]
 {analysis.summary if analysis else '없음'}
 
-[프로필]
+[피해자 프로필]
 {profile_str}
 
-[선택된 기법 {len(selected_techniques)}개]
+[생성된 공격 수법 {len(selected_techniques)}개]
 {techniques_str}
 
 다음 JSON 형식으로 출력하세요:
 {{
-    "summary": "전체 분석의 핵심 요약 (3-4문장)",
-    "vulnerabilities": ["취약점 1", "취약점 2", ...],
-    "recommendations": ["권장 사항 1", "권장 사항 2", ...],
-    "implementation_guide": "전체적인 적용 가이드"
+    "summary": "피해자 분석 및 공격 전략 핵심 요약 (3-4문장)",
+    "vulnerabilities": ["공략 가능한 취약점 1", "공략 가능한 취약점 2", ...],
+    "attack_strategies": ["공격 전략 1: 구체적인 실행 방법", "공격 전략 2: 구체적인 실행 방법", ...],
+    "implementation_guide": "시뮬레이션에서 수법을 적용하는 순서와 방법"
 }}
 
 JSON만 출력하세요.
@@ -332,7 +336,7 @@ JSON만 출력하세요.
             profile=profile,
             vulnerabilities=report_data.get("vulnerabilities", []),
             techniques=selected_techniques,
-            recommendations=report_data.get("recommendations", []),
+            recommendations=report_data.get("attack_strategies", []),  # 공격 전략
             implementation_guide=report_data.get("implementation_guide"),
         )
 
