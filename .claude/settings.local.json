@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(dir \"C:\\\\projects\\\\2026\\\\20260204\\(web_search\\)\\\\VP-Web-Search\")"
+    ]
+  }
+}

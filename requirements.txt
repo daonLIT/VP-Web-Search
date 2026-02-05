@@ -1,17 +1,26 @@
-langchain==1.2.7
+# Core LangChain
+langchain>=0.2.0
 langchain-core
-langchain-community
 langchain-openai
-langchain-chroma
-chromadb
-langgraph==1.0.7
-langgraph-prebuilt
+langgraph>=0.1.0
+
+# Search
 langchain-tavily
 tavily-python
-python-dotenv
-langsmith
 
-fastapi==0.108.0
-uvicorn[standard]==0.25.0
-pydantic==2.7.4
-python-multipart==0.0.6
+# Web Framework
+fastapi>=0.108.0
+uvicorn[standard]>=0.25.0
+pydantic>=2.7.0
+python-multipart>=0.0.6
+
+# Scraping
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# Utils
+python-dotenv
+
+# Optional: Vector DB (for future use)
+# langchain-chroma
+# chromadb

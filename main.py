@@ -1,20 +1,70 @@
 # main.py
-from fastapi import FastAPI, HTTPException
+"""
+VP-Web-Search API Server
+
+범용 데이터 분석 및 웹 검색 API
+- 어떤 형태의 데이터든 받아서 분석/요약
+- 자동 검색 쿼리 생성 및 웹 검색
+- 취약점 분석 및 기법 생성
+"""
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, Dict, Any, List
 import uvicorn
 
-from app.orchestrator_attack import build_attack_enhancement_orchestrator
+from app.api.routes import router
+from app.config import SETTINGS
+
+# 로깅 설정
+logging.basicConfig(
+    level=getattr(logging, SETTINGS.log_level),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """애플리케이션 라이프사이클"""
+    logger.info("Starting VP-Web-Search API...")
+    logger.info(f"Model: {SETTINGS.model_name}")
+    yield
+    logger.info("Shutting down...")
+
 
 # FastAPI 앱 생성
 app = FastAPI(
-    title="VoicePhishing Intelligence API",
-    description="보이스피싱 최신 수법 지침 제공 및 크롤링 API",
-    version="1.0.0"
+    title="VP-Web-Search API",
+    description="""
+## 범용 데이터 분석 및 웹 검색 API
+
+어떤 형태의 데이터든 받아서:
+1. **분석/요약** - 데이터에서 핵심 정보 추출
+2. **검색 쿼리 생성** - 관련 정보 검색을 위한 쿼리 자동 생성
+3. **웹 검색** - Tavily API를 통한 검색 및 본문 크롤링
+4. **기법 생성** - 수집된 정보 기반 분석 기법 생성
+5. **리포트 작성** - 종합 리포트 출력
+
+### 지원 데이터 형식
+- **텍스트**: 대화 내용, 문서 등
+- **JSON 객체**: 구조화된 데이터
+- **배열**: 여러 항목의 리스트
+
+### API 엔드포인트
+- `POST /api/analyze` - 전체 분석 파이프라인
+- `POST /api/analyze/quick` - 빠른 분석 (검색 없이)
+- `POST /api/search` - 웹 검색만
+- `GET /health` - 헬스 체크
+    """,
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
-# CORS 설정 (다른 시스템에서 호출 가능하도록)
+# CORS 설정
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # 프로덕션에서는 특정 도메인만 허용
@@ -23,157 +73,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Orchestrator 초기화
-print("🚀 Initializing orchestrators...")
-attack_orch = build_attack_enhancement_orchestrator(model_name="gpt-4o")
-print("✅ Orchestrators ready!")
+# 라우터 등록
+app.include_router(router)
 
 
-# ==================== Pydantic 모델 정의 ====================
-
-class GuidanceRequest(BaseModel):
-    """지침 요청 모델"""
-    phishing: bool
-    type: str
-    scenario: str
-    victim_profile: Optional[Dict[str, Any]] = None
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "phishing": True,
-                "type": "검경 사칭",
-                "scenario": "검찰 사칭해서 현금 편취",
-                "victim_profile": {
-                    "age": 65,
-                    "occupation": "퇴직자"
-                }
-            }
-        }
-
-
-class CrawlRequest(BaseModel):
-    """크롤링 요청 모델"""
-    site_url: str
-    keywords: Optional[List[str]] = None
-    max_articles: Optional[int] = 30
-    max_pages: Optional[int] = 5
-    pagination_type: Optional[str] = "auto"
-    target_type: Optional[str] = None
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "site_url": "https://www.kisa.or.kr/402?page=1&searchDiv=10&searchWord=피싱",
-                "keywords": ["보이스피싱", "스미싱", "피싱"],
-                "max_articles": 20,
-                "max_pages": 3,
-                "pagination_type": "auto",
-                "target_type": None
-            }
-        }
-
-
-class GuidanceResponse(BaseModel):
-    """지침 응답 모델"""
-    status: str
-    guidance: Dict[str, Any]
-    guidance_id: Optional[str] = None
-    source: str
-
-
-class CrawlResponse(BaseModel):
-    """크롤링 응답 모델"""
-    status: str
-    site_url: str
-    pages_crawled: Optional[int] = 0
-    crawled_count: Optional[int] = 0
-    extracted_count: Optional[int] = 0
-    types_generated: Optional[int] = 0
-    guidance_ids: Optional[List[str]] = []
-    guidance: Optional[Dict[str, Any]] = None
-    source_articles: Optional[List[Dict[str, str]]] = []
-
-class AttackEnhancementRequest(BaseModel):
-    """공격 강화 분석 요청"""
-    conversation_summary: str
-    
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "conversation_summary": "피해자는 30대 중후반 남자 직장인이다. 피싱범은 전화로 연락해 공식 기관 소속을 내세워 신뢰를 얻으려 한다..."
-            }
-        }
-
-# ==================== API 엔드포인트 ====================
-
+# 루트 엔드포인트
 @app.get("/")
 async def root():
-    """API 상태 확인"""
+    """API 정보"""
     return {
-        "service": "VoicePhishing Intelligence API",
+        "service": "VP-Web-Search API",
+        "version": "2.0.0",
         "status": "running",
-        "version": "1.0.0",
         "endpoints": {
-            "guidance": "/api/guidance",
-            "crawl": "/api/crawl",
-            "health": "/health",
-            "docs": "/docs"
-        }
+            "analyze": "POST /api/analyze - 전체 분석",
+            "quick_analyze": "POST /api/analyze/quick - 빠른 분석",
+            "search": "POST /api/search - 웹 검색",
+            "health": "GET /health - 헬스 체크",
+            "docs": "GET /docs - API 문서",
+        },
     }
 
-
-@app.get("/health")
-async def health_check():
-    """헬스 체크"""
-    return {
-        "status": "healthy",
-        "guidance_orchestrator": "ready",
-        "crawl_orchestrator": "ready"
-    }
-
-
-@app.post("/api/attack/enhance")
-async def enhance_attack_scenario(request: AttackEnhancementRequest):
-    """
-    대화 요약 분석 → 취약점 파악 → 강화 수법 생성
-    
-    **Process:**
-    1. 피해자 프로필 추출
-    2. 취약점 질문 생성
-    3. 웹 검색 (심리학/사회학 관점)
-    4. 수법 10개 생성
-    5. 적합한 수법 3개 이상 선택
-    6. 최종 리포트 작성
-    """
-    try:
-        result = attack_orch.handle(request.dict())
-        
-        if result.get("status") == "error":
-            raise HTTPException(
-                status_code=500,
-                detail=result.get("message")
-            )
-        
-        return result
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ==================== 서버 실행 ====================
 
 if __name__ == "__main__":
-    print("\n" + "="*60)
-    print("🎯 VoicePhishing Intelligence API Server (Web Search)")
-    print("="*60)
-    print("📍 Server: http://localhost:8001")
-    print("📚 Docs: http://localhost:8001/docs")
-    print("🔍 Health: http://localhost:8001/health")
-    print("="*60 + "\n")
+    print("\n" + "=" * 60)
+    print("🔬 VP-Web-Search API Server v2.0")
+    print("=" * 60)
+    print(f"📍 Server: http://localhost:8001")
+    print(f"📚 Docs: http://localhost:8001/docs")
+    print(f"🔍 Health: http://localhost:8001/health")
+    print(f"🤖 Model: {SETTINGS.model_name}")
+    print("=" * 60 + "\n")
 
     uvicorn.run(
-        app,
+        "main:app",
         host="0.0.0.0",
-        port=8001,  # 기존 시스템(8000)과 분리
-        log_level="info"
+        port=8001,
+        reload=True,
+        log_level="info",
     )
