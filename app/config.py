@@ -37,6 +37,10 @@ class Settings:
     # Logging
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
 
+    # Webhook - VP2로 결과 전송
+    webhook_url: str = field(default_factory=lambda: os.getenv("WEBHOOK_URL", ""))
+    webhook_timeout: int = field(default_factory=lambda: int(os.getenv("WEBHOOK_TIMEOUT", "30")))
+
 
 # 싱글톤 설정 인스턴스
 SETTINGS = Settings()

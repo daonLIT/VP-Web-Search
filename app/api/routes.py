@@ -14,6 +14,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 
+import httpx
+
 from app.schemas import (
     AnalysisRequest,
     AnalysisResponse,
@@ -27,6 +29,7 @@ from app.schemas import (
     MethodReportResponse,
 )
 from app.agents import build_research_agent
+from app.config import SETTINGS
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +40,8 @@ router = APIRouter()
 _received_judgements: Dict[str, Dict[str, Any]] = {}
 _received_conversations: Dict[str, Dict[str, Any]] = {}
 _analysis_results: Dict[str, Dict[str, Any]] = {}  # 분석 결과 저장
+_analyzed_cases: set = set()  # 이미 분석 완료된 case_id 추적
+_analyzing_cases: set = set()  # 현재 분석 중인 case_id 추적
 
 # 에이전트 인스턴스 (lazy init)
 _agent = None
@@ -290,6 +295,46 @@ def _format_turns_for_analysis(turns: List[str]) -> str:
     return "\n".join(turns)
 
 
+async def _send_webhook(payload: Dict[str, Any], webhook_url: Optional[str] = None) -> bool:
+    """
+    분석 결과를 VP2로 전송 (Webhook)
+
+    Args:
+        payload: 전송할 데이터
+        webhook_url: 전송할 URL (없으면 설정에서 가져옴)
+
+    Returns:
+        성공 여부
+    """
+    url = webhook_url or SETTINGS.webhook_url
+
+    if not url:
+        logger.warning("[Webhook] URL이 설정되지 않음. 전송 스킵.")
+        return False
+
+    try:
+        async with httpx.AsyncClient(timeout=SETTINGS.webhook_timeout) as client:
+            response = await client.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+
+            if response.status_code in (200, 201, 202):
+                logger.info(f"[Webhook] 전송 성공: {url}, status={response.status_code}")
+                return True
+            else:
+                logger.error(f"[Webhook] 전송 실패: {url}, status={response.status_code}, body={response.text[:200]}")
+                return False
+
+    except httpx.TimeoutException:
+        logger.error(f"[Webhook] 타임아웃: {url}")
+        return False
+    except Exception as e:
+        logger.error(f"[Webhook] 전송 에러: {url}, error={e}")
+        return False
+
+
 async def _trigger_analysis_background(
     case_id: str,
     turns: List[str],
@@ -298,6 +343,19 @@ async def _trigger_analysis_background(
     victim_profile: Optional[Dict[str, Any]] = None,
 ):
     """백그라운드에서 분석 트리거 (선택적)"""
+
+    # 이미 분석 완료된 케이스인지 확인
+    if case_id in _analyzed_cases:
+        logger.info(f"[Background] 이미 분석 완료된 케이스, 스킵: case_id={case_id}")
+        return
+
+    # 현재 분석 중인 케이스인지 확인
+    if case_id in _analyzing_cases:
+        logger.info(f"[Background] 이미 분석 진행 중인 케이스, 스킵: case_id={case_id}")
+        return
+
+    # 분석 시작 표시
+    _analyzing_cases.add(case_id)
     analysis_id = f"analysis_{case_id}_{uuid.uuid4().hex[:8]}"
 
     try:
@@ -330,7 +388,7 @@ async def _trigger_analysis_background(
             report_data = result.report.model_dump() if hasattr(result.report, 'model_dump') else result.report
             techniques = result.report.techniques if hasattr(result.report, 'techniques') else []
 
-        _analysis_results[analysis_id] = {
+        analysis_data = {
             "analysis_id": analysis_id,
             "case_id": case_id,
             "status": result.status,
@@ -345,12 +403,31 @@ async def _trigger_analysis_background(
             "analyzed_at": datetime.utcnow().isoformat(),
         }
 
+        # 메모리에 저장
+        _analysis_results[analysis_id] = analysis_data
+
         logger.info(f"[Background] 분석 완료: case_id={case_id}, status={result.status}, analysis_id={analysis_id}")
+
+        # Webhook으로 VP2에 전송
+        if result.status == "success":
+            webhook_payload = {
+                "type": "analysis_complete",
+                "case_id": case_id,
+                "analysis_id": analysis_id,
+                "report": report_data,
+                "techniques": [t.model_dump() if hasattr(t, 'model_dump') else t for t in techniques] if techniques else [],
+                "sources_count": len(result.sources) if result.sources else 0,
+                "analyzed_at": datetime.utcnow().isoformat(),
+            }
+            await _send_webhook(webhook_payload)
+
+            # 분석 완료 표시
+            _analyzed_cases.add(case_id)
 
     except Exception as e:
         logger.error(f"[Background] 분석 실패: case_id={case_id}, error={e}")
         # 에러도 저장
-        _analysis_results[analysis_id] = {
+        error_data = {
             "analysis_id": analysis_id,
             "case_id": case_id,
             "status": "error",
@@ -358,13 +435,28 @@ async def _trigger_analysis_background(
             "error": str(e),
             "analyzed_at": datetime.utcnow().isoformat(),
         }
+        _analysis_results[analysis_id] = error_data
+
+        # 에러도 webhook으로 전송
+        error_payload = {
+            "type": "analysis_error",
+            "case_id": case_id,
+            "analysis_id": analysis_id,
+            "error": str(e),
+            "analyzed_at": datetime.utcnow().isoformat(),
+        }
+        await _send_webhook(error_payload)
+
+    finally:
+        # 분석 중 상태 해제
+        _analyzing_cases.discard(case_id)
 
 
 @router.post("/api/v1/judgements", response_model=JudgementResponse)
 async def receive_judgement(
     request: JudgementRequest,
     background_tasks: BackgroundTasks,
-    auto_analyze: bool = False,
+    auto_analyze: bool = True
 ):
     """
     VP2로부터 판정+대화 데이터 수신
@@ -605,3 +697,41 @@ async def get_analysis_by_case(case_id: str):
     if not results:
         raise HTTPException(status_code=404, detail="해당 케이스의 분석 결과 없음")
     return {"ok": True, "count": len(results), "items": results}
+
+
+@router.delete("/api/v1/analysis/case/{case_id}/reset")
+async def reset_case_analysis(case_id: str):
+    """
+    케이스의 분석 상태 리셋
+    - 해당 케이스를 다시 분석할 수 있도록 상태 초기화
+    """
+    was_analyzed = case_id in _analyzed_cases
+    was_analyzing = case_id in _analyzing_cases
+
+    _analyzed_cases.discard(case_id)
+    _analyzing_cases.discard(case_id)
+
+    logger.info(f"[Reset] 케이스 분석 상태 리셋: case_id={case_id}, was_analyzed={was_analyzed}, was_analyzing={was_analyzing}")
+
+    return {
+        "ok": True,
+        "message": f"케이스 {case_id}의 분석 상태가 리셋되었습니다.",
+        "was_analyzed": was_analyzed,
+        "was_analyzing": was_analyzing,
+    }
+
+
+@router.get("/api/v1/analysis/status")
+async def get_analysis_status():
+    """
+    전체 분석 상태 조회
+    - 분석 완료된 케이스 목록
+    - 현재 분석 중인 케이스 목록
+    """
+    return {
+        "ok": True,
+        "analyzed_cases": list(_analyzed_cases),
+        "analyzing_cases": list(_analyzing_cases),
+        "analyzed_count": len(_analyzed_cases),
+        "analyzing_count": len(_analyzing_cases),
+    }
